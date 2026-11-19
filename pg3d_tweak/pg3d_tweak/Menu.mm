@@ -80,6 +80,11 @@ std::string Player_GetNickname(Il2CppObject* player);
         if (!Camera_WorldToScreen_ext(camera, headWS, &headSS)) continue;
         if (!Camera_WorldToScreen_ext(camera, feetWS, &feetSS)) continue;
 
+        // Coordenadas de tela (hx/hy = cabeça, fx/fy = pés)
+        CGFloat hx = headSS.x, hy = headSS.y;
+        CGFloat fx = feetSS.x, fy = feetSS.y;
+        (void)fx; // só fy é usado na box/ancora de distância; fx mantido por simetria/depuração
+
         // Altura da box em pixels
         CGFloat boxH = fabs(fy - hy);
         if (boxH < 5.0f) continue;
