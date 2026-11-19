@@ -5,9 +5,9 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <string>
 
 // ---- tipos opacos ----
-typedef struct Il2CppObject   Il2CppObject;
 typedef struct Il2CppClass    Il2CppClass;
 typedef struct Il2CppImage    Il2CppImage;
 typedef struct Il2CppDomain   Il2CppDomain;
@@ -17,6 +17,15 @@ typedef struct Il2CppType     Il2CppType;
 typedef struct Il2CppField    Il2CppField;
 typedef struct Il2CppString   Il2CppString;
 typedef struct Il2CppArray    Il2CppArray;
+
+// Cabeçalho real de objeto IL2CPP (igual em todo runtime IL2CPP, não é
+// valor específico de build): klass + monitor. Fonte: il2cpp-object-internals.h
+// público do runtime. Precisa de definição completa (não só forward decl)
+// porque Il2CppString/Il2CppArray o usam por valor abaixo.
+struct Il2CppObject {
+    Il2CppClass* klass;
+    void*        monitor;
+};
 
 // String managed
 struct Il2CppString {
@@ -40,7 +49,9 @@ struct Vector3 { float x, y, z; };
 struct Vector4 { float x, y, z, w; };
 struct Quaternion { float x, y, z, w; };
 struct Color { float r, g, b, a; };
-struct Rect { float x, y, width, height; };
+// Nome "Rect" colide com struct Rect de MacTypes.h (QuickDraw legado,
+// incluído transitivamente pelo SDK do iOS). Renomeado para evitar a redefinição.
+struct Il2CppRect { float x, y, width, height; };
 struct Matrix4x4 { float m[16]; }; // column-major
 
 // ---- ponteiros de função (preenchidos em HookManager.mm) ----
