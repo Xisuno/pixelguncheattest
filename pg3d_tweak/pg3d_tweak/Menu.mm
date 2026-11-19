@@ -80,12 +80,6 @@ std::string Player_GetNickname(Il2CppObject* player);
         if (!Camera_WorldToScreen_ext(camera, headWS, &headSS)) continue;
         if (!Camera_WorldToScreen_ext(camera, feetWS, &feetSS)) continue;
 
-        // Unity screen Y é de baixo pra cima; UIKit é de cima pra baixo
-        CGFloat boxW = boxH * 0.4f; // proporção padrão, já que fx sozinho não define largura
-CGFloat boxX = hx - boxW / 2.0f;
-CGFloat boxY = hy;
-CGRect espBox = CGRectMake(boxX, boxY, boxW, boxH);
-
         // Altura da box em pixels
         CGFloat boxH = fabs(fy - hy);
         if (boxH < 5.0f) continue;
