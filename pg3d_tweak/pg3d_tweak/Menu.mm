@@ -22,10 +22,12 @@ extern "C" {
     Il2CppObject* Camera_GetMain(void);
     bool     Camera_WorldToScreen_ext(Il2CppObject* cam, Vector3 world, Vector3* out);
     Vector3  Transform_GetPos_ext(Il2CppObject* tr);
-    std::string Player_GetNickname(Il2CppObject* player);
     float    Player_GetHealth(Il2CppObject* player);
     bool     Player_IsLocal(Il2CppObject* player);
 }
+
+// Fora do extern "C", com linkage C++ normal
+std::string Player_GetNickname(Il2CppObject* player);
 
 // ============================================================
 //  ESPView – redesenha sobre o jogo
@@ -79,14 +81,13 @@ extern "C" {
         if (!Camera_WorldToScreen_ext(camera, feetWS, &feetSS)) continue;
 
         // Unity screen Y é de baixo pra cima; UIKit é de cima pra baixo
-        CGFloat screenH = self.bounds.size.height;
-        CGFloat hx = headSS.x;
-        CGFloat hy = screenH - headSS.y;
-        CGFloat fx = feetSS.x;
-        CGFloat fy = screenH - feetSS.y;
+        CGFloat boxW = boxH * 0.4f; // proporção padrão, já que fx sozinho não define largura
+CGFloat boxX = hx - boxW / 2.0f;
+CGFloat boxY = hy;
+CGRect espBox = CGRectMake(boxX, boxY, boxW, boxH);
 
         // Altura da box em pixels
-        CGFloat boxH = fabsf(fy - hy);
+        CGFloat boxH = fabs(fy - hy);
         if (boxH < 5.0f) continue;
         CGFloat boxW = boxH * 0.5f;
 
