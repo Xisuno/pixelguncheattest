@@ -1,0 +1,71 @@
+name: Build PG3D Cheat DEB
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      # 1. Checkout
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Locate project root (supports any folder name that contains a Makefile with tweak.mk)
+      - name: Locate project root
+        id: locate
+        run: |
+          WORKSPACE="${{ github.workspace }}"
+
+          # Find the first Makefile that includes tweak.mk, up to 3 levels deep
+          FOUND=$(find "$WORKSPACE" -maxdepth 3 -name Makefile \
+                    -not -path '*/.git/*' \
+                    -not -path '*/theos/*' \
+                    | xargs grep -l "include.*tweak\.mk" 2>/dev/null | head -1)
+
+          if [ -z "$FOUND" ]; then
+            echo "ERROR: No Makefile with tweak.mk found. Repo tree:"
+            find "$WORKSPACE" -maxdepth 4 -not -path '*/.git/*' -not -path '*/theos/*' | sort
+            exit 1
+          fi
+
+          PROJECT_ROOT="$(dirname "$FOUND")"
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+          echo "Found: $PROJECT_ROOT/Makefile"
+          grep "include.*tweak.mk" "$PROJECT_ROOT/Makefile"
+
+      # 3. Install ldid (Theos needs it to sign the dylib)
+      - name: Install ldid
+        run: brew install ldid
+
+      # 4. Set up Theos
+      - name: Set up Theos
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          git clone --depth=1 --filter=blob:none --sparse https://github.com/theos/sdks.git "$RUNNER_TEMP/sdks"
+          git -C "$RUNNER_TEMP/sdks" sparse-checkout set iPhoneOS16.5.sdk
+          mkdir -p "$THEOS/sdks"
+          cp -R "$RUNNER_TEMP/sdks/iPhoneOS16.5.sdk" "$THEOS/sdks/"
+          ls "$THEOS/sdks"
+
+      # 5. Build .deb
+      - name: Build tweak
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          cd "${{ steps.locate.outputs.PROJECT_ROOT }}"
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+
+      # 6. Upload .deb artifact
+      - name: Upload DEB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg3d-cheat-deb
+          path: ${{ steps.locate.outputs.PROJECT_ROOT }}/packages/*.deb
+          if-no-files-found: error
+          retention-days: 30
