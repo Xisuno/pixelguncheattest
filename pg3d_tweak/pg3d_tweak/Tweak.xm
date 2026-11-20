@@ -1,42 +1,39 @@
 // Tweak.xm
 // Entry point do Theos tweak.
-// Hooks no nível ObjC para detectar quando o jogo inicializa,
-// depois delega para HookManager (IL2CPP) e Menu (UIKit).
+// Dispara tudo direto do %ctor, sem depender de hookar o AppDelegate.
+//
+// Correção (2026-11-19): a versão anterior usava `%hook UIApplication` com
+// `application:didFinishLaunchingWithOptions:`. Esse método NUNCA é
+// implementado pela própria UIApplication — é o delegate do app quem o
+// implementa (em jogo Unity/IL2CPP isso costuma ser `UnityAppController`,
+// não `UIApplication`). Como a UIApplication nunca recebe essa mensagem
+// nela mesma, o hook nunca disparava: a dylib carregava (log do %ctor
+// aparecia), mas HookManager_Init()/Menu_Setup() nunca eram chamados e o
+// menu nunca aparecia. Removido o %hook; tudo roda a partir do %ctor, que
+// dispara garantidamente quando o Substrate injeta a dylib no processo.
 
 #import <UIKit/UIKit.h>
 #include "HookManager.h"
 #include "Menu.h"
 
-// ---- Detecta o início do UIApplicationDelegate do jogo ----
-// O Pixel Gun 3D usa um AppDelegate normal.
-// Hookamos application:didFinishLaunchingWithOptions: para garantir
-// que o UIWindow do jogo existe antes de criarmos o overlay.
+// ---- Constructor ----
+%ctor {
+    // %ctor roda quando a dylib é injetada pelo Substrate, bem antes de
+    // UIApplicationMain. O dispatch_after abaixo só é efetivamente drenado
+    // quando o run loop principal começar a rodar (depois de
+    // UIApplicationMain), então é seguro agendar aqui mesmo sem UIWindow
+    // existir ainda.
+    NSLog(@"[pg3d_tweak] dylib carregada");
 
-%hook UIApplication
-
-- (BOOL)application:(UIApplication*)application
-    didFinishLaunchingWithOptions:(NSDictionary*)opts {
-
-    BOOL result = %orig;
-
-    // Inicia o HookManager em background (resolve IL2CPP API)
+    // Inicia o HookManager em background (resolve IL2CPP API).
+    // HookManager_Init() já tem um sleep(2) interno esperando a
+    // GameAssembly terminar de inicializar.
     HookManager_Init();
 
-    // Inicia o menu na main thread depois de um pequeno delay
-    // (garante que a janela do jogo já existe)
+    // Inicia o menu na main thread depois de um delay
+    // (garante que a janela do jogo já existe).
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         Menu_Setup();
     });
-
-    return result;
-}
-
-%end
-
-// ---- Constructor ----
-%ctor {
-    // %ctor roda quando a dylib é injetada pelo Substrate.
-    // Nada precisa ser feito aqui; tudo acontece no hook acima.
-    NSLog(@"[pg3d_tweak] dylib carregada");
 }
