@@ -218,7 +218,7 @@ std::string Player_GetNickname(Il2CppObject* player);
                        dispatch_get_main_queue(), ^{ [self setup]; });
         return;
     }
-    PG3D_Log("[pg3d_tweak] windowScene=%p state=%ld", (void*)scene,
+    PG3D_Log("[pg3d_tweak] windowScene=%p state=%ld", (__bridge void*)scene,
              scene ? (long)scene.activationState : -1L);
 
     CGRect screen = scene ? scene.coordinateSpace.bounds : [UIScreen mainScreen].bounds;
