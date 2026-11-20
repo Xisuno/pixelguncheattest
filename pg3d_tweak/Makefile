@@ -1,7 +1,7 @@
 THEOS_PACKAGE_DIR_NAME = packages
 export TARGET = iphone:clang:16.5:14.0
 
-ARCHS = arm64
+ARCHS = arm64e
 
 include $(THEOS)/makefiles/common.mk
 
