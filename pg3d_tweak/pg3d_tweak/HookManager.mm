@@ -50,10 +50,11 @@ static fn_Camera_GetFov      icall_Camera_GetFov            = nullptr;
 static fn_Camera_SetFov      icall_Camera_SetFov            = nullptr;
 
 // Métodos hooked
+// (apenas meth_PlayerUpdate é mantido como global: os MethodInfo* de
+// ClickerDetector/CheatDetectedBanner são resolvidos e usados localmente
+// dentro de InitThread como m_cu/m_ca/m_ba/m_bu, sem necessidade de cache
+// a nível de arquivo — por isso não há mais globals correspondentes aqui.)
 static MethodInfo* meth_PlayerUpdate      = nullptr;
-static MethodInfo* meth_ClickerUpdate     = nullptr;
-static MethodInfo* meth_BannerAwake       = nullptr;
-static MethodInfo* meth_BannerUpdate      = nullptr;
 
 // FindObjectsOfType<T>() via icall – retorna array de objetos
 // Assinatura IL2CPP: Object[] FindObjectsOfTypeAll(Type t)
