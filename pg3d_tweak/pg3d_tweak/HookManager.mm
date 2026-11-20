@@ -22,6 +22,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <ctime>
+#include <os/log.h>
 
 #include "il2cpp_api.h"
 #include "offsets.h"
@@ -38,7 +39,7 @@ CheatState   g_cheat       = { false, false, 15.0f, false, false, true, false };
 // ============================================================
 // Caminho efetivo onde conseguimos escrever pela última vez (ou string
 // vazia se ainda nenhuma chamada conseguiu abrir um arquivo).
-static char s_logPath[64] = {0};
+static char s_logPath[256] = {0};
 
 const char* PG3D_LogPath(void) { return s_logPath; }
 
@@ -49,34 +50,25 @@ void PG3D_Log(const char* fmt, ...) {
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
-    // Sempre manda pro NSLog/syslog também, não é ou um ou outro.
-    NSLog(@"%s", msg);
+    // os_log com %{public}s: NSLog com string dinâmica pode sair como <private>.
+    os_log(OS_LOG_DEFAULT, "%{public}s", msg);
 
-    // Tenta /var/mobile primeiro (home do usuário mobile, não deveria ser
-    // bloqueado pelo sandbox em bootstraps rootless comuns); se falhar,
-    // cai para /tmp, que normalmente é gravável por qualquer processo.
-    static const char* kCandidates[2] = {
-        "/var/mobile/pg3d_tweak.log",
-        "/tmp/pg3d_tweak.log"
-    };
-    for (int i = 0; i < 2; i++) {
-        FILE* f = fopen(kCandidates[i], "a");
-        if (!f) continue; // sem permissão/caminho não existe: tenta o próximo
-        time_t now = time(nullptr);
-        struct tm tmv;
-        localtime_r(&now, &tmv);
-        char ts[16];
-        strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
-        fprintf(f, "[%s] %s\n", ts, msg);
-        fflush(f);
-        fclose(f);
-        strncpy(s_logPath, kCandidates[i], sizeof(s_logPath) - 1);
-        return; // escreveu com sucesso, não precisa tentar o outro caminho
-    }
-    // Se chegou aqui, nenhum dos dois caminhos é gravável por este processo
-    // (sandbox bloqueando ambos). Isso por si só já é informação: significa
-    // que ESCRITA EM ARQUIVO não é viável nesse processo, não só o %ctor
-    // que não roda. NSLog acima é o único registro que resta.
+    // Arquivo dentro do container do app (o sandbox bloqueia /var/mobile e /tmp
+    // para apps do App Store). Caminho: <container>/tmp/pg3d_tweak.log
+    const char* tmp = NSTemporaryDirectory().fileSystemRepresentation;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/pg3d_tweak.log", tmp ? tmp : "/tmp");
+    FILE* f = fopen(path, "a");
+    if (!f) return;
+    time_t now = time(nullptr);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    char ts[16];
+    strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
+    fprintf(f, "[%s] %s\n", ts, msg);
+    fflush(f);
+    fclose(f);
+    strncpy(s_logPath, path, sizeof(s_logPath) - 1);
 }
 
 // Ponteiros para classes IL2CPP (preenchidos em Init)
