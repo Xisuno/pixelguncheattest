@@ -1,0 +1,908 @@
+// HookManager.mm
+// Responsável por:
+//   1. Resolver a API IL2CPP via dlopen/dlsym na GameAssembly
+//   2. Encontrar as classes Player_move_c, ClickerDetector, CheatDetectedBanner
+//   3. Instalar MSHookFunction/MSHookMessageEx nos métodos alvo
+//   4. Prover helpers para o resto do cheat
+//
+// Design: internal DLL injetada pelo Theos/Substrate no processo do PG3D.
+
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <substrate.h>
+#include <pthread.h>
+#include <string>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <unistd.h>
+#include <cstdio>
+#include <cstdarg>
+#include <cstring>
+#include <ctime>
+#include <os/log.h>
+
+#include "il2cpp_api.h"
+#include "offsets.h"
+#include "HookManager.h"
+
+// ============================================================
+//  Globals
+// ============================================================
+Il2CppAPI    g_il2cpp      = {};
+// Ordem tem que bater exatamente com CheatState em HookManager.h:
+// aimbot, aimLock, aimbotFov, esp, espSkeleton, acBypass, teamCheck,
+// wallCheck, minRange, initialized.
+CheatState   g_cheat       = { false, false, 15.0f, false, false, true, false, false, 0.0f, false };
+
+// ============================================================
+//  Log de diagnóstico (NSLog + arquivo)
+// ============================================================
+// Caminho efetivo onde conseguimos escrever pela última vez (ou string
+// vazia se ainda nenhuma chamada conseguiu abrir um arquivo).
+static char s_logPath[256] = {0};
+
+const char* PG3D_LogPath(void) { return s_logPath; }
+
+void PG3D_Log(const char* fmt, ...) {
+    char msg[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    // os_log com %{public}s: NSLog com string dinâmica pode sair como <private>.
+    os_log(OS_LOG_DEFAULT, "%{public}s", msg);
+
+    // Arquivo dentro do container do app (o sandbox bloqueia /var/mobile e /tmp
+    // para apps do App Store). Caminho: <container>/tmp/pg3d_tweak.log
+    const char* tmp = NSTemporaryDirectory().fileSystemRepresentation;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/pg3d_tweak.log", tmp ? tmp : "/tmp");
+    FILE* f = fopen(path, "a");
+    if (!f) return;
+    time_t now = time(nullptr);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    char ts[16];
+    strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
+    fprintf(f, "[%s] %s\n", ts, msg);
+    fflush(f);
+    fclose(f);
+    strncpy(s_logPath, path, sizeof(s_logPath) - 1);
+}
+
+// Ponteiros para classes IL2CPP (preenchidos em Init)
+static Il2CppClass* cls_PlayerMove    = nullptr;
+static Il2CppClass* cls_ClickerDet    = nullptr;
+static Il2CppClass* cls_CheatBanner   = nullptr;
+static Il2CppClass* cls_Camera        = nullptr;
+static Il2CppClass* cls_Transform     = nullptr;
+static Il2CppClass* cls_Object        = nullptr;
+// UnityEngine.Behaviour.get_enabled() — usado pelo teamcheck para ler o
+// estado (enabled/disabled) dos componentes OutlineEffectComponent que o
+// próprio jogo já usa para colorir aliado vs inimigo (PlayerMove::allyOutline
+// / enemyOutline em offsets.h). Não inventamos offset de "time": lemos um
+// sinal que o jogo já calcula.
+static Il2CppClass* cls_Behaviour     = nullptr;
+static MethodInfo*  s_mGetEnabled     = nullptr;
+// UnityEngine.Physics.Raycast — usado pelo wallcheck.
+// ATENÇÃO (assunção não confirmada em runtime): Physics tem várias
+// sobrecargas de Raycast; pegamos a primeira com param_count == 3, que
+// deveria ser bool Raycast(Vector3 origin, Vector3 direction, float
+// maxDistance). Isso NÃO foi validado contra o dump.cs desta build — há
+// risco real de pegar outra sobrecarga de 3 parâmetros (ex.: a que tem
+// "out RaycastHit" em vez de maxDistance) e o resultado da chamada ficar
+// sem sentido. Antes de confiar no wallcheck: ativar wallCheck sozinho,
+// ficar atrás de uma parede sólida e confirmar no log/visualmente que o
+// ESP/aimbot some; se o comportamento for errático, resolver a sobrecarga
+// certa via il2cpp_method_get_param (tipo de cada parâmetro) em vez de
+// param_count.
+static Il2CppClass* cls_Physics       = nullptr;
+static MethodInfo*  s_mRaycast        = nullptr;
+
+// Icalls Unity que usamos para Transform.position e Camera.WorldToScreenPoint
+typedef void (*fn_Transform_GetPos)(void* tr, Vector3* out);
+typedef void (*fn_Camera_W2S)(void* cam, Vector3* world, Vector3* out);
+typedef void (*fn_Camera_GetFov)(void* cam, float* out);
+typedef void (*fn_Camera_SetFov)(void* cam, float fov);
+typedef void (*fn_Input_GetMouseButton)(int btn, bool* out);
+
+static fn_Transform_GetPos   icall_Transform_get_position  = nullptr;
+static fn_Camera_W2S         icall_Camera_WorldToScreen     = nullptr;
+static fn_Camera_GetFov      icall_Camera_GetFov            = nullptr;
+static fn_Camera_SetFov      icall_Camera_SetFov            = nullptr;
+
+// Métodos hooked
+// (apenas meth_PlayerUpdate é mantido como global: os MethodInfo* de
+// ClickerDetector/CheatDetectedBanner são resolvidos e usados localmente
+// dentro de InitThread como m_cu/m_ca/m_ba/m_bu, sem necessidade de cache
+// a nível de arquivo — por isso não há mais globals correspondentes aqui.)
+static MethodInfo* meth_PlayerUpdate      = nullptr;
+
+// FindObjectsOfType<T>() via icall – retorna array de objetos
+// Assinatura IL2CPP: Object[] FindObjectsOfTypeAll(Type t)
+typedef Il2CppArray* (*fn_FindObjectsOfTypeAll)(void* type, void* ex);
+static fn_FindObjectsOfTypeAll icall_FindObjectsAll = nullptr;
+
+// GetType de Il2CppClass
+typedef void* (*fn_GetType)(Il2CppClass*);
+static fn_GetType icall_GetType = nullptr;
+
+// ============================================================
+//  Trampoline originals
+// ============================================================
+static void (*orig_PlayerUpdate)  (Il2CppObject*, void*)  = nullptr;
+static void (*orig_ClickerUpdate) (Il2CppObject*, void*)  = nullptr;
+static void (*orig_BannerAwake)   (Il2CppObject*, void*)  = nullptr;
+static void (*orig_BannerUpdate)  (Il2CppObject*, void*)  = nullptr;
+
+// ============================================================
+//  Helpers de posição/câmera
+// ============================================================
+// Os helpers abaixo chamam MÉTODOS GERENCIADOS via il2cpp_runtime_invoke, em
+// vez de icalls cujos nomes/assinaturas mudam entre versões do Unity.
+// Retorno de value type (Vector3, int) vem BOXED: dados em obj + 0x10.
+static MethodInfo* s_mGetMain = nullptr;   // static Camera.get_main()
+static MethodInfo* s_mW2S     = nullptr;   // Camera.WorldToScreenPoint(Vector3)
+static MethodInfo* s_mGetPos  = nullptr;   // Transform.get_position()
+static MethodInfo* s_mPixW    = nullptr;   // Camera.get_pixelWidth()
+static MethodInfo* s_mPixH    = nullptr;   // Camera.get_pixelHeight()
+
+static Il2CppObject* s_mainCam      = nullptr;
+static int           s_camFrameCnt  = 0;
+static float         s_pixW         = 0.0f; // tamanho do render target da câmera
+static float         s_pixH         = 0.0f;
+
+static void ResolveManagedHelpers() {
+    static bool done = false;
+    if (done || !g_il2cpp.class_get_method_from_name || !cls_Camera || !cls_Transform) return;
+    done = true;
+    s_mGetMain = g_il2cpp.class_get_method_from_name(cls_Camera,    "get_main", 0);
+    s_mW2S     = g_il2cpp.class_get_method_from_name(cls_Camera,    "WorldToScreenPoint", 1);
+    s_mGetPos  = g_il2cpp.class_get_method_from_name(cls_Transform, "get_position", 0);
+    s_mPixW    = g_il2cpp.class_get_method_from_name(cls_Camera,    "get_pixelWidth", 0);
+    s_mPixH    = g_il2cpp.class_get_method_from_name(cls_Camera,    "get_pixelHeight", 0);
+    PG3D_Log("[pg3d_tweak] MANAGED: Camera.get_main=%p WorldToScreenPoint(1)=%p Transform.get_position=%p get_pixelWidth=%p get_pixelHeight=%p",
+             (void*)s_mGetMain, (void*)s_mW2S, (void*)s_mGetPos, (void*)s_mPixW, (void*)s_mPixH);
+}
+
+static float CamPixel(Il2CppObject* cam, MethodInfo* m) {
+    if (!cam || !m || !g_il2cpp.runtime_invoke) return 0.0f;
+    void* ex = nullptr;
+    Il2CppObject* ret = g_il2cpp.runtime_invoke(m, cam, nullptr, &ex);
+    if (!ret || ex) return 0.0f;
+    return (float)Field<int32_t>(ret, 0x10);
+}
+
+static Vector3 GetTransformPosition(Il2CppObject* transform) {
+    Vector3 pos = {0,0,0};
+    if (!transform) return pos;
+    ResolveManagedHelpers();
+    if (s_mGetPos && g_il2cpp.runtime_invoke) {
+        void* ex = nullptr;
+        Il2CppObject* ret = g_il2cpp.runtime_invoke(s_mGetPos, transform, nullptr, &ex);
+        if (ret && !ex) return Field<Vector3>(ret, 0x10);
+    }
+    if (icall_Transform_get_position)
+        icall_Transform_get_position(transform, &pos);
+    return pos;
+}
+
+// Converte mundo -> coordenadas do overlay UIKit (pontos, origem no canto
+// superior esquerdo). O Unity devolve PIXELS do render target com origem no
+// canto INFERIOR esquerdo; por isso inverte Y e reescala para os pontos da tela.
+// out.z = profundidade (>0 = na frente da câmera).
+static bool WorldToScreen(Il2CppObject* camera, Vector3 world, Vector3& out) {
+    if (!camera) return false;
+    ResolveManagedHelpers();
+    if (!s_mW2S || !g_il2cpp.runtime_invoke) return false;
+    void* args[1] = { &world };
+    void* ex = nullptr;
+    Il2CppObject* ret = g_il2cpp.runtime_invoke(s_mW2S, camera, args, &ex);
+    if (!ret || ex) return false;
+    Vector3 px = Field<Vector3>(ret, 0x10);
+    if (px.z <= 0.0f || !std::isfinite(px.x) || !std::isfinite(px.y)) return false;
+    if (s_pixW <= 0.0f || s_pixH <= 0.0f) return false;
+    CGRect b = [UIScreen mainScreen].bounds;
+    out.x = px.x / s_pixW * (float)b.size.width;
+    out.y = (1.0f - px.y / s_pixH) * (float)b.size.height;
+    out.z = px.z;
+    return true;
+}
+
+static Il2CppObject* GetMainCamera() {
+    if (s_camFrameCnt++ < 30 && s_mainCam) return s_mainCam;
+    s_camFrameCnt = 0;
+    ResolveManagedHelpers();
+    if (!s_mGetMain || !g_il2cpp.runtime_invoke) {
+        static bool s_camLogged = false;
+        if (!s_camLogged) {
+            s_camLogged = true;
+            PG3D_Log("[pg3d_tweak] CAMERA: Camera.get_main indisponivel (get_main=%p cls_Camera=%p)",
+                     (void*)s_mGetMain, (void*)cls_Camera);
+        }
+        return s_mainCam;
+    }
+    void* ex = nullptr;
+    Il2CppObject* cam = g_il2cpp.runtime_invoke(s_mGetMain, nullptr, nullptr, &ex);
+    s_mainCam = (cam && !ex) ? cam : nullptr; // nulo se a câmera sumiu (evita ponteiro velho)
+    if (s_mainCam) {
+        s_pixW = CamPixel(s_mainCam, s_mPixW);
+        s_pixH = CamPixel(s_mainCam, s_mPixH);
+        static bool s_camOk = false;
+        if (!s_camOk) {
+            s_camOk = true;
+            PG3D_Log("[pg3d_tweak] CAMERA: main=%p pixel=%.0fx%.0f", (void*)s_mainCam, s_pixW, s_pixH);
+        }
+    }
+    return s_mainCam;
+}
+
+// ============================================================
+//  Lista de players (atualizada no hook de PlayerUpdate)
+// ============================================================
+static std::vector<Il2CppObject*> s_players;
+static pthread_mutex_t            s_playerMtx = PTHREAD_MUTEX_INITIALIZER;
+
+static void AddPlayer(Il2CppObject* p) {
+    pthread_mutex_lock(&s_playerMtx);
+    for (auto& x : s_players) if (x == p) { pthread_mutex_unlock(&s_playerMtx); return; }
+    s_players.push_back(p);
+    pthread_mutex_unlock(&s_playerMtx);
+}
+
+static void RemoveDeadPlayers() {
+    // chamado periodicamente no Update do local player
+    // limpa ponteiros que não estão mais vivos (heurística: transform null)
+    pthread_mutex_lock(&s_playerMtx);
+    s_players.erase(
+        std::remove_if(s_players.begin(), s_players.end(), [](Il2CppObject* p) {
+            if (!p) return true;
+            Il2CppObject* tr = Field<Il2CppObject*>(p, PlayerMove::myPlayerTransform);
+            return tr == nullptr;
+        }),
+        s_players.end());
+    pthread_mutex_unlock(&s_playerMtx);
+}
+
+// ============================================================
+//  Aimbot: seleciona alvo mais próximo ao centro da tela
+// ============================================================
+
+// Chama PhotonView.get_isMine() via icall
+static MethodInfo* meth_isMine = nullptr;
+static bool IsLocalPlayer(Il2CppObject* player) {
+    if (!meth_isMine) return false;
+    Il2CppObject* pv = Field<Il2CppObject*>(player, PlayerMove::photonView);
+    if (!pv) return false;
+    bool result = false;
+    void* ex = nullptr;
+    Il2CppObject* ret = g_il2cpp.runtime_invoke(meth_isMine, pv, nullptr, &ex);
+    if (ret) result = Field<bool>(ret, 0x10); // unboxed bool
+    return result;
+}
+
+static Il2CppObject* s_localPlayer = nullptr;
+
+// ============================================================
+//  Teamcheck: lê o estado (enabled) dos componentes de outline que o
+//  próprio jogo já usa para pintar aliado (allyOutline) vs inimigo
+//  (enemyOutline). Não existe offset de "time" confirmado no dump.cs
+//  fornecido, então não inventamos um — usamos um sinal que já está no
+//  objeto e é medido (offsets.h: PlayerMove::allyOutline/enemyOutline).
+// ============================================================
+enum class TeamStatus { Unknown, Ally, Enemy };
+
+static bool GetBehaviourEnabled(Il2CppObject* component) {
+    if (!component || !s_mGetEnabled || !g_il2cpp.runtime_invoke) return false;
+    void* ex = nullptr;
+    Il2CppObject* ret = g_il2cpp.runtime_invoke(s_mGetEnabled, component, nullptr, &ex);
+    if (!ret || ex) return false;
+    return Field<bool>(ret, 0x10); // bool boxed
+}
+
+static TeamStatus GetTeamStatus(Il2CppObject* player) {
+    if (!player) return TeamStatus::Unknown;
+    Il2CppObject* allyC  = Field<Il2CppObject*>(player, PlayerMove::allyOutline);
+    Il2CppObject* enemyC = Field<Il2CppObject*>(player, PlayerMove::enemyOutline);
+    bool allyEnabled  = GetBehaviourEnabled(allyC);
+    bool enemyEnabled = GetBehaviourEnabled(enemyC);
+    if (enemyEnabled && !allyEnabled) return TeamStatus::Enemy;
+    if (allyEnabled && !enemyEnabled) return TeamStatus::Ally;
+    // Ambos ligados, ambos desligados, ou componentes nulos: ambíguo.
+    // Loga uma vez para não gerar ruído por frame.
+    static bool s_ambiguousLogged = false;
+    if (!s_ambiguousLogged) {
+        s_ambiguousLogged = true;
+        PG3D_Log("[pg3d_tweak] TEAMCHECK: status ambiguo para player=%p allyC=%p(%d) enemyC=%p(%d) — "
+                 "teamcheck vai tratar como inimigo (fail-open) ate confirmar em jogo",
+                 (void*)player, (void*)allyC, (int)allyEnabled, (void*)enemyC, (int)enemyEnabled);
+    }
+    return TeamStatus::Unknown;
+}
+
+// ============================================================
+//  Wallcheck: Physics.Raycast entre a cabeça do player local e a cabeça
+//  do alvo. true = bloqueado (há algo no meio). Ver aviso sobre a
+//  sobrecarga de Raycast assumida, junto da declaração de s_mRaycast.
+// ============================================================
+static bool RaycastBlocked(Vector3 from, Vector3 to) {
+    if (!s_mRaycast || !g_il2cpp.runtime_invoke) return false; // sem API -> falha aberto (não bloqueia)
+    Vector3 dir = { to.x - from.x, to.y - from.y, to.z - from.z };
+    float dist = sqrtf(dir.x*dir.x + dir.y*dir.y + dir.z*dir.z);
+    if (dist < 0.01f) return false;
+    dir.x /= dist; dir.y /= dist; dir.z /= dist;
+    void* args[3] = { &from, &dir, &dist };
+    void* ex = nullptr;
+    Il2CppObject* ret = g_il2cpp.runtime_invoke(s_mRaycast, nullptr, args, &ex);
+    if (!ret || ex) return false; // chamada falhou -> falha aberto
+    return Field<bool>(ret, 0x10);
+}
+
+// ============================================================
+//  Diagnóstico sob demanda: loga o estado REAL (resolvido em runtime ou
+//  não) de tudo que teamcheck/wallcheck dependem. Chamado pelo Menu.mm
+//  assim que o usuário mexe no switch correspondente, pra não precisar
+//  esperar o log periódico do Update. Se os ponteiros saírem NULL aqui,
+//  o filtro correspondente é garantidamente um no-op (fail-open) — não
+//  pode ser a causa de nada travar.
+// ============================================================
+extern "C" void Diag_LogFilterStatus(const char* who) {
+    PG3D_Log("[pg3d_tweak] DIAG(%s): ready=%d localPlayer=%p players=%zu | "
+             "teamcheck: cls_Behaviour=%p get_enabled=%p | "
+             "wallcheck: cls_Physics=%p Raycast=%p | "
+             "flags: teamCheck=%d wallCheck=%d minRange=%.1f aimbot=%d aimLock=%d",
+             who, (int)g_cheat.initialized, (void*)s_localPlayer, s_players.size(),
+             (void*)cls_Behaviour, (void*)s_mGetEnabled,
+             (void*)cls_Physics, (void*)s_mRaycast,
+             (int)g_cheat.teamCheck, (int)g_cheat.wallCheck, g_cheat.minRange,
+             (int)g_cheat.aimbot, (int)g_cheat.aimLock);
+}
+
+// ============================================================
+//  Filtro único usado pelo aimbot (SelectAimTarget) e pelo ESP (Menu.mm),
+//  para que os dois concordem sobre quem é um alvo válido.
+// ============================================================
+extern "C" bool Player_PassesFilters(Il2CppObject* player) {
+    if (!player || player == s_localPlayer) return false;
+
+    // Log periódico (não por chamada — isso é por frame, por jogador)
+    // mostrando a decisão real tomada, só quando algum filtro está ligado.
+    // Serve pra ver no log se teamcheck está de fato classificando todo
+    // mundo como Ally (o que explicaria o ESP sumir inteiro) ou se o
+    // problema é em outro lugar.
+    if (g_cheat.teamCheck || g_cheat.wallCheck) {
+        static int s_filterLogCnt = 0;
+        if (s_filterLogCnt++ % 180 == 0) {
+            TeamStatus dbgTeam = g_cheat.teamCheck ? GetTeamStatus(player) : TeamStatus::Unknown;
+            PG3D_Log("[pg3d_tweak] FILTER: player=%p teamCheck=%d team=%d(0=Unk,1=Ally,2=Enemy) "
+                     "wallCheck=%d Raycast_resolved=%d",
+                     (void*)player, (int)g_cheat.teamCheck, (int)dbgTeam,
+                     (int)g_cheat.wallCheck, (int)(s_mRaycast != nullptr));
+        }
+    }
+
+    if (g_cheat.teamCheck) {
+        if (GetTeamStatus(player) == TeamStatus::Ally) return false;
+        // Enemy ou Unknown: passa (fail-open — nunca escondemos um inimigo
+        // real por causa de um status ambíguo).
+    }
+
+    if (g_cheat.minRange > 0.0f && s_localPlayer) {
+        Il2CppObject* myTr    = Field<Il2CppObject*>(s_localPlayer, PlayerMove::myPlayerTransform);
+        Il2CppObject* theirTr = Field<Il2CppObject*>(player,        PlayerMove::myPlayerTransform);
+        if (myTr && theirTr) {
+            Vector3 myPos    = GetTransformPosition(myTr);
+            Vector3 theirPos = GetTransformPosition(theirTr);
+            float dx = theirPos.x - myPos.x, dy = theirPos.y - myPos.y, dz = theirPos.z - myPos.z;
+            float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+            if (dist < g_cheat.minRange) return false;
+        }
+        // Sem Transform resolvido: não dá para medir distância -> não filtra.
+    }
+
+    if (g_cheat.wallCheck && s_localPlayer) {
+        Il2CppObject* myHead    = Field<Il2CppObject*>(s_localPlayer, PlayerMove::headTransform);
+        Il2CppObject* theirHead = Field<Il2CppObject*>(player,        PlayerMove::headTransform);
+        if (myHead && theirHead) {
+            Vector3 from = GetTransformPosition(myHead);
+            Vector3 to   = GetTransformPosition(theirHead);
+            if (RaycastBlocked(from, to)) return false;
+        }
+    }
+
+    return true;
+}
+
+struct AimTarget {
+    Il2CppObject* player;
+    Vector3       screenPos;
+    float         distFromCenter;
+};
+
+static AimTarget SelectAimTarget(Il2CppObject* camera) {
+    AimTarget best = { nullptr, {}, 1e9f };
+    if (!camera) return best;
+
+    // Centro da tela
+    // UIScreen.mainScreen.bounds – usamos 1920/2 e 1080/2 como fallback
+    // (o overlay corrige antes de desenhar)
+    CGRect screen = [UIScreen mainScreen].bounds;
+    // WorldToScreen já devolve pontos UIKit (origem topo-esquerdo), sem fator de escala.
+    float cx = (float)screen.size.width  * 0.5f;
+    float cy = (float)screen.size.height * 0.5f;
+
+    float fovRad = g_cheat.aimbotFov * (M_PI / 180.0f);
+    // Comparação é feita abaixo via sinf(fovRad/2) contra a proporção
+    // dist/screenLen (ver loop); não usamos cosFov aqui.
+
+    pthread_mutex_lock(&s_playerMtx);
+    std::vector<Il2CppObject*> copy = s_players;
+    pthread_mutex_unlock(&s_playerMtx);
+
+    for (Il2CppObject* p : copy) {
+        if (!p || p == s_localPlayer) continue;
+        if (!Player_PassesFilters(p)) continue; // teamcheck / minRange / wallcheck
+
+        Il2CppObject* headTr = Field<Il2CppObject*>(p, PlayerMove::headTransform);
+        if (!headTr) continue;
+
+        Vector3 headWS = GetTransformPosition(headTr);
+        Vector3 ss;
+        if (!WorldToScreen(camera, headWS, ss)) continue;
+
+        float dx = ss.x - cx;
+        float dy = ss.y - cy;
+        float dist = sqrtf(dx*dx + dy*dy);
+
+        // Checa se está dentro do FOV (em pixels)
+        // alternativa: comparar cos do ângulo na tela
+        float screenLen = sqrtf(cx*cx + cy*cy);
+        if (dist / screenLen > sinf(fovRad * 0.5f)) continue;
+
+        if (dist < best.distFromCenter) {
+            best.player        = p;
+            best.screenPos     = ss;
+            best.distFromCenter= dist;
+        }
+    }
+    return best;
+}
+
+// Envia toque simulado de look via UIApplication (aproximação simples):
+// No PG3D o look é controlado por input touchscreen, não por mouse.
+// A forma mais limpa é rotacionar o myCameraContainer do local player.
+// Usamos o Transform.set_rotation ou LookAt via icall.
+static MethodInfo* meth_Transform_LookAt = nullptr;
+
+static void AimAtTarget(Il2CppObject* localPlayer, Il2CppObject* targetHeadTransform) {
+    if (!localPlayer || !targetHeadTransform) return;
+
+    // Pega o container de câmera do player local.
+    // 0x478 = myCameraContainer, CONFIRMADO contra o dump.cs real
+    // (PlayerMove, campo "public UnityEngine.Transform myCameraContainer; // 0x478").
+    Il2CppObject* camContainer = Field<Il2CppObject*>(localPlayer, 0x478);
+    if (!camContainer || !meth_Transform_LookAt) return;
+
+    // DIAGNÓSTICO (inversão de joystick relatada com aimLock ligado):
+    // loga periodicamente pra confirmar se este LookAt é de fato o que
+    // está rodando quando o problema aparece, e com quais ponteiros.
+    // Este hook é PRÉ-EXISTENTE (não foi adicionado nesta sessão) — o
+    // log serve só pra isolar se a causa é aqui ou em outro lugar.
+    static int s_aimLogCnt = 0;
+    if (s_aimLogCnt++ % 60 == 0) {
+        PG3D_Log("[pg3d_tweak] AIMAT: localPlayer=%p camContainer=%p targetHead=%p LookAtMethod=%p",
+                 (void*)localPlayer, (void*)camContainer, (void*)targetHeadTransform,
+                 (void*)meth_Transform_LookAt);
+    }
+
+    // Transform.LookAt(Transform target) recebe o Transform diretamente via icall/
+    // runtime_invoke; não precisamos da posição em Vector3 aqui.
+    void* args[1] = { targetHeadTransform };
+    void* ex = nullptr;
+    g_il2cpp.runtime_invoke(meth_Transform_LookAt, camContainer, args, &ex);
+    if (ex) {
+        static bool s_exLogged = false;
+        if (!s_exLogged) {
+            s_exLogged = true;
+            PG3D_Log("[pg3d_tweak] AIMAT: Transform.LookAt lancou excecao (ex=%p) — "
+                     "resultado da rotacao pode ficar indefinido", ex);
+        }
+    }
+}
+
+// ============================================================
+//  Hook: Player_move_c.Update
+// ============================================================
+static void hook_PlayerUpdate(Il2CppObject* self, void* /*unused*/) {
+    {
+        static int s_updCnt = 0;
+        if (s_updCnt++ % 600 == 0) {
+            pthread_mutex_lock(&s_playerMtx);
+            size_t np = s_players.size();
+            pthread_mutex_unlock(&s_playerMtx);
+            PG3D_Log("[pg3d_tweak] UPDATE #%d self=%p local=%p isMineMeth=%p cam=%p players=%zu aimbot=%d esp=%d",
+                     s_updCnt, (void*)self, (void*)s_localPlayer, (void*)meth_isMine,
+                     (void*)s_mainCam, np, (int)g_cheat.aimbot, (int)g_cheat.esp);
+        }
+    }
+    // Registra este player na lista global
+    AddPlayer(self);
+
+    // Detecta o local player: aquele cujo PhotonView.isMine == true
+    if (IsLocalPlayer(self)) {
+        s_localPlayer = self;
+    }
+
+    // Chama o original
+    if (orig_PlayerUpdate) orig_PlayerUpdate(self, nullptr);
+
+    // ---- Lógica do cheat (roda somente para o local player) ----
+    if (self != s_localPlayer || !s_localPlayer) return;
+
+    // Limpeza periódica de players mortos
+    static int cleanCnt = 0;
+    if (++cleanCnt >= 60) { cleanCnt = 0; RemoveDeadPlayers(); }
+
+    Il2CppObject* camera = GetMainCamera();
+    if (!camera) return;
+
+    // ---- Aimbot / AimLock ----
+    if (g_cheat.aimbot || g_cheat.aimLock) {
+        AimTarget target = SelectAimTarget(camera);
+        if (target.player) {
+            Il2CppObject* headTr = Field<Il2CppObject*>(target.player, PlayerMove::headTransform);
+            AimAtTarget(s_localPlayer, headTr);
+        }
+    }
+}
+
+// ============================================================
+//  Hook: ClickerDetector.Update  → NOP (bypass anticheat)
+// ============================================================
+static void hook_ClickerUpdate(Il2CppObject* self, void* /*unused*/) {
+    if (g_cheat.acBypass) return; // descarta detecção completamente
+    if (orig_ClickerUpdate) orig_ClickerUpdate(self, nullptr);
+}
+
+// ============================================================
+//  Hook: CheatDetectedBanner.Awake + Update → NOP
+// ============================================================
+static void hook_BannerAwake(Il2CppObject* self, void* /*unused*/) {
+    // Não chama o original: banner nunca se inicializa
+    if (!g_cheat.acBypass && orig_BannerAwake) orig_BannerAwake(self, nullptr);
+}
+
+static void hook_BannerUpdate(Il2CppObject* self, void* /*unused*/) {
+    if (!g_cheat.acBypass && orig_BannerUpdate) orig_BannerUpdate(self, nullptr);
+}
+
+// ============================================================
+//  Also zera os flags internos do ClickerDetector instance
+//  chamado pelo hook de Awake do ClickerDetector
+// ============================================================
+static void (*orig_ClickerAwake)(Il2CppObject*, void*) = nullptr;
+static void hook_ClickerAwake(Il2CppObject* self, void* unused) {
+    if (orig_ClickerAwake) orig_ClickerAwake(self, unused);
+    if (g_cheat.acBypass && self) {
+        // Desabilita via campo enable @ 0x20
+        Field<bool>(self, ClickerDetectorOff::enabled) = false;
+    }
+}
+
+// ============================================================
+//  Resolve icalls Unity pelo nome completo
+// ============================================================
+static void* ResolveIcall(const char* name) {
+    if (!g_il2cpp.resolve_icall) return nullptr;
+    return g_il2cpp.resolve_icall(name);
+}
+
+// ============================================================
+//  Instala hook MSHookFunction num método IL2CPP
+// ============================================================
+static bool HookMethod(MethodInfo* method, void* hook, void** orig, const char* name = "?") {
+    if (!method) { PG3D_Log("[pg3d_tweak] HOOK %s: MethodInfo NULL (metodo nao encontrado)", name); return false; }
+    // O ponteiro para o código do método fica em method->methodPointer
+    // Na struct MethodInfo do IL2CPP:
+    //   offset 0x0 = Il2CppMethodPointer methodPointer
+    void* methodPtr = *reinterpret_cast<void**>(method);
+    if (!methodPtr) { PG3D_Log("[pg3d_tweak] HOOK %s: methodPointer NULL", name); return false; }
+    MSHookFunction(methodPtr, hook, orig);
+    PG3D_Log("[pg3d_tweak] HOOK %s: instalado em %p (orig=%p)", name, methodPtr, orig ? *orig : nullptr);
+    return true;
+}
+
+// ============================================================
+//  HookManager_Init – roda em thread separada depois de 2s
+// ============================================================
+static void* InitThread(void*) {
+    PG3D_Log("[pg3d_tweak] InitThread iniciada, aguardando 2s...");
+    sleep(2); // aguarda a GameAssembly terminar de inicializar
+    PG3D_Log("[pg3d_tweak] InitThread acordou, tentando dlopen GameAssembly...");
+
+    // 1. Localiza a API IL2CPP.
+    //
+    // IMPORTANTE (achado em 2026-11-20, confirmado pelo Info.plist real do
+    // bundle): no iOS, o Unity IL2CPP NÃO gera um "GameAssembly.dylib"
+    // separado como faz em Android/Windows/Mac. O código IL2CPP gerado é
+    // compilado como lib estática e linkado DENTRO do executável principal
+    // do app (aqui, o binário chamado "zombiegun3d" — CFBundleExecutable
+    // confirmado no device). Por isso os dois dlopen por nome de arquivo
+    // abaixo sempre falhavam: esse arquivo nunca existiu nesse bundle.
+    //
+    // Correção: pega um handle para a imagem principal do processo com
+    // dlopen(NULL, ...) — isso sempre existe, não depende de nome de
+    // arquivo nenhum — e usa RTLD_DEFAULT como fallback, que procura em
+    // TODAS as imagens carregadas (inclui o executável principal).
+    void* ga = dlopen(nullptr, RTLD_NOW);
+    if (!ga) {
+        PG3D_Log("[pg3d_tweak] ERRO: dlopen(NULL) falhou, usando RTLD_DEFAULT como fallback");
+        ga = RTLD_DEFAULT;
+    }
+
+    // 2. Resolve API IL2CPP (handle da imagem principal, ou RTLD_DEFAULT)
+    g_il2cpp.domain_get              = (t_il2cpp_domain_get)             dlsym(ga, "il2cpp_domain_get");
+    g_il2cpp.domain_assembly_open    = (t_il2cpp_domain_assembly_open)   dlsym(ga, "il2cpp_domain_assembly_open");
+    g_il2cpp.assembly_get_image      = (t_il2cpp_assembly_get_image)     dlsym(ga, "il2cpp_assembly_get_image");
+    g_il2cpp.class_from_name         = (t_il2cpp_class_from_name)        dlsym(ga, "il2cpp_class_from_name");
+    g_il2cpp.class_get_method_from_name = (t_il2cpp_class_get_method_from_name) dlsym(ga, "il2cpp_class_get_method_from_name");
+    g_il2cpp.class_get_field_from_name  = (t_il2cpp_class_get_field_from_name)  dlsym(ga, "il2cpp_class_get_field_from_name");
+    g_il2cpp.field_get_value         = (t_il2cpp_field_get_value)        dlsym(ga, "il2cpp_field_get_value");
+    g_il2cpp.field_set_value         = (t_il2cpp_field_set_value)        dlsym(ga, "il2cpp_field_set_value");
+    g_il2cpp.object_get_class        = (t_il2cpp_object_get_class)       dlsym(ga, "il2cpp_object_get_class");
+    g_il2cpp.runtime_invoke          = (t_il2cpp_runtime_invoke)         dlsym(ga, "il2cpp_runtime_invoke");
+    g_il2cpp.array_addr_with_size    = (t_il2cpp_array_addr_with_size)   dlsym(ga, "il2cpp_array_addr_with_size");
+    g_il2cpp.array_length            = (t_il2cpp_array_length)           dlsym(ga, "il2cpp_array_length");
+    g_il2cpp.string_new              = (t_il2cpp_string_new)             dlsym(ga, "il2cpp_string_new");
+    g_il2cpp.resolve_icall           = (t_resolve_icall)                 dlsym(ga, "il2cpp_resolve_icall");
+
+    // Se o handle da imagem principal não resolveu nada (os 3 símbolos
+    // essenciais ainda nulos), tenta de novo com RTLD_DEFAULT antes de
+    // desistir — cobre o caso de dlopen(NULL) ter devolvido um handle
+    // "válido" mas que por algum motivo de symbol visibility não enxerga
+    // os símbolos il2cpp_* (acontece se eles foram exportados só via
+    // RTLD_DEFAULT e não pelo próprio handle da main image).
+    if ((!g_il2cpp.domain_get || !g_il2cpp.class_from_name || !g_il2cpp.runtime_invoke)
+        && ga != RTLD_DEFAULT) {
+        PG3D_Log("[pg3d_tweak] handle da main image não resolveu il2cpp_*, tentando RTLD_DEFAULT");
+        g_il2cpp.domain_get              = (t_il2cpp_domain_get)             dlsym(RTLD_DEFAULT, "il2cpp_domain_get");
+        g_il2cpp.domain_assembly_open    = (t_il2cpp_domain_assembly_open)   dlsym(RTLD_DEFAULT, "il2cpp_domain_assembly_open");
+        g_il2cpp.assembly_get_image      = (t_il2cpp_assembly_get_image)     dlsym(RTLD_DEFAULT, "il2cpp_assembly_get_image");
+        g_il2cpp.class_from_name         = (t_il2cpp_class_from_name)        dlsym(RTLD_DEFAULT, "il2cpp_class_from_name");
+        g_il2cpp.class_get_method_from_name = (t_il2cpp_class_get_method_from_name) dlsym(RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
+        g_il2cpp.class_get_field_from_name  = (t_il2cpp_class_get_field_from_name)  dlsym(RTLD_DEFAULT, "il2cpp_class_get_field_from_name");
+        g_il2cpp.field_get_value         = (t_il2cpp_field_get_value)        dlsym(RTLD_DEFAULT, "il2cpp_field_get_value");
+        g_il2cpp.field_set_value         = (t_il2cpp_field_set_value)        dlsym(RTLD_DEFAULT, "il2cpp_field_set_value");
+        g_il2cpp.object_get_class        = (t_il2cpp_object_get_class)       dlsym(RTLD_DEFAULT, "il2cpp_object_get_class");
+        g_il2cpp.runtime_invoke          = (t_il2cpp_runtime_invoke)         dlsym(RTLD_DEFAULT, "il2cpp_runtime_invoke");
+        g_il2cpp.array_addr_with_size    = (t_il2cpp_array_addr_with_size)   dlsym(RTLD_DEFAULT, "il2cpp_array_addr_with_size");
+        g_il2cpp.array_length            = (t_il2cpp_array_length)           dlsym(RTLD_DEFAULT, "il2cpp_array_length");
+        g_il2cpp.string_new              = (t_il2cpp_string_new)             dlsym(RTLD_DEFAULT, "il2cpp_string_new");
+        g_il2cpp.resolve_icall           = (t_resolve_icall)                 dlsym(RTLD_DEFAULT, "il2cpp_resolve_icall");
+    }
+
+    if (!g_il2cpp.domain_get || !g_il2cpp.class_from_name || !g_il2cpp.runtime_invoke) {
+        PG3D_Log("[pg3d_tweak] ERRO: API IL2CPP incompleta (domain_get=%p class_from_name=%p runtime_invoke=%p)",
+                 (void*)g_il2cpp.domain_get, (void*)g_il2cpp.class_from_name, (void*)g_il2cpp.runtime_invoke);
+        return nullptr;
+    }
+
+    PG3D_Log("[pg3d_tweak] API: assembly_get_image=%p get_method=%p get_field=%p array_len=%p array_addr=%p string_new=%p resolve_icall=%p",
+             (void*)g_il2cpp.assembly_get_image, (void*)g_il2cpp.class_get_method_from_name,
+             (void*)g_il2cpp.class_get_field_from_name, (void*)g_il2cpp.array_length,
+             (void*)g_il2cpp.array_addr_with_size, (void*)g_il2cpp.string_new,
+             (void*)g_il2cpp.resolve_icall);
+
+    // 3. Obtém a imagem Assembly-CSharp.dll
+    Il2CppDomain*   domain = g_il2cpp.domain_get();
+    Il2CppAssembly* asm_csharp = g_il2cpp.domain_assembly_open(domain, "Assembly-CSharp");
+    if (!asm_csharp) {
+        PG3D_Log("[pg3d_tweak] ERRO: Assembly-CSharp não encontrada");
+        return nullptr;
+    }
+    Il2CppImage* img = g_il2cpp.assembly_get_image(asm_csharp);
+
+    // 4. Encontra classes
+    // Player_move_c está no namespace "" (global)
+    cls_PlayerMove  = g_il2cpp.class_from_name(img, "",  "Player_move_c");
+    cls_ClickerDet  = g_il2cpp.class_from_name(img, "",  "ClickerDetector");
+    cls_CheatBanner = g_il2cpp.class_from_name(img, "",  "CheatDetectedBanner");
+
+    // Camera e Transform vêm do UnityEngine
+    Il2CppAssembly* asm_ue = g_il2cpp.domain_assembly_open(domain, "UnityEngine.CoreModule");
+    Il2CppImage*    img_ue = asm_ue ? g_il2cpp.assembly_get_image(asm_ue) : nullptr;
+    if (img_ue) {
+        cls_Camera    = g_il2cpp.class_from_name(img_ue, "UnityEngine", "Camera");
+        cls_Transform = g_il2cpp.class_from_name(img_ue, "UnityEngine", "Transform");
+        cls_Object    = g_il2cpp.class_from_name(img_ue, "UnityEngine", "Object");
+    }
+
+    if (img_ue) {
+        cls_Behaviour = g_il2cpp.class_from_name(img_ue, "UnityEngine", "Behaviour");
+        if (cls_Behaviour) s_mGetEnabled = g_il2cpp.class_get_method_from_name(cls_Behaviour, "get_enabled", 0);
+    }
+    PG3D_Log("[pg3d_tweak] CLASSES: Player_move_c=%p ClickerDetector=%p CheatDetectedBanner=%p | UnityEngine.CoreModule=%p Camera=%p Transform=%p Object=%p Behaviour=%p get_enabled=%p",
+             (void*)cls_PlayerMove, (void*)cls_ClickerDet, (void*)cls_CheatBanner,
+             (void*)asm_ue, (void*)cls_Camera, (void*)cls_Transform, (void*)cls_Object,
+             (void*)cls_Behaviour, (void*)s_mGetEnabled);
+
+    // UnityEngine.Physics mora em UnityEngine.PhysicsModule, não no CoreModule.
+    {
+        Il2CppAssembly* asm_phys = g_il2cpp.domain_assembly_open(domain, "UnityEngine.PhysicsModule");
+        Il2CppImage*    img_phys = asm_phys ? g_il2cpp.assembly_get_image(asm_phys) : nullptr;
+        if (img_phys) {
+            cls_Physics = g_il2cpp.class_from_name(img_phys, "UnityEngine", "Physics");
+            if (cls_Physics) s_mRaycast = g_il2cpp.class_get_method_from_name(cls_Physics, "Raycast", 3);
+        }
+        PG3D_Log("[pg3d_tweak] PHYSICS: UnityEngine.PhysicsModule=%p Physics=%p Raycast(3 args, NAO CONFIRMADO)=%p",
+                 (void*)asm_phys, (void*)cls_Physics, (void*)s_mRaycast);
+    }
+
+    if (!cls_PlayerMove) {
+        PG3D_Log("[pg3d_tweak] ERRO: Player_move_c não encontrada");
+        return nullptr;
+    }
+
+    // 5. Resolve icalls Unity
+    // Nomes de icall no formato "UnityEngine.Transform::get_position_Injected"
+    icall_Transform_get_position = (fn_Transform_GetPos) ResolveIcall(
+        "UnityEngine.Transform::get_position_Injected");
+    icall_Camera_WorldToScreen = (fn_Camera_W2S) ResolveIcall(
+        "UnityEngine.Camera::WorldToScreenPoint_Injected");
+    icall_Camera_GetFov = (fn_Camera_GetFov) ResolveIcall(
+        "UnityEngine.Camera::get_fieldOfView");
+    icall_Camera_SetFov = (fn_Camera_SetFov) ResolveIcall(
+        "UnityEngine.Camera::set_fieldOfView");
+
+    // FindObjectsOfType<T> via icall
+    icall_FindObjectsAll = (fn_FindObjectsOfTypeAll) ResolveIcall(
+        "UnityEngine.Object::FindObjectsOfType_internal");
+    icall_GetType = (fn_GetType) ResolveIcall(
+        "UnityEngine.RuntimeTypeHandle::GetRuntimeTypeFromHandle");
+
+    PG3D_Log("[pg3d_tweak] ICALLS: Transform.get_position_Injected=%p Camera.WorldToScreenPoint_Injected=%p Camera.get_fieldOfView=%p Camera.set_fieldOfView=%p Object.FindObjectsOfType_internal=%p RuntimeTypeHandle.GetRuntimeTypeFromHandle=%p",
+             (void*)icall_Transform_get_position, (void*)icall_Camera_WorldToScreen,
+             (void*)icall_Camera_GetFov, (void*)icall_Camera_SetFov,
+             (void*)icall_FindObjectsAll, (void*)icall_GetType);
+
+    // 6. Encontra e hooka métodos
+    // Player_move_c.Update (sem parâmetros → param_count = 0)
+    meth_PlayerUpdate = g_il2cpp.class_get_method_from_name(cls_PlayerMove, "Update", 0);
+    HookMethod(meth_PlayerUpdate, (void*)hook_PlayerUpdate, (void**)&orig_PlayerUpdate, "Player_move_c.Update");
+
+    // isMine getter no PhotonView
+    // PhotonView está em Photon.MonoBehaviour derivado – buscamos a imagem certa
+    // PhotonView: a assembly depende da versao do PUN; sonda candidatas e loga
+    // o resultado de cada uma (nenhuma e assumida como correta).
+    {
+        static const char* kPhotonAsms[]  = { "Assembly-CSharp-firstpass", "Photon3Unity3D", "Assembly-CSharp" };
+        static const char* kIsMineNames[] = { "get_isMine", "get_IsMine" };
+        for (const char* an : kPhotonAsms) {
+            Il2CppAssembly* a = g_il2cpp.domain_assembly_open(domain, an);
+            Il2CppImage* im = a ? g_il2cpp.assembly_get_image(a) : nullptr;
+            Il2CppClass* cpv = im ? g_il2cpp.class_from_name(im, "", "PhotonView") : nullptr;
+            PG3D_Log("[pg3d_tweak] PHOTON: assembly=%s asm=%p PhotonView=%p", an, (void*)a, (void*)cpv);
+            if (!cpv) continue;
+            for (const char* mn : kIsMineNames) {
+                MethodInfo* m = g_il2cpp.class_get_method_from_name(cpv, mn, 0);
+                PG3D_Log("[pg3d_tweak] PHOTON:   %s = %p", mn, (void*)m);
+                if (m && !meth_isMine) meth_isMine = m;
+            }
+        }
+        PG3D_Log("[pg3d_tweak] PHOTON: meth_isMine final=%p", (void*)meth_isMine);
+    }
+
+    // ClickerDetector hooks
+    if (cls_ClickerDet) {
+        MethodInfo* m_cu = g_il2cpp.class_get_method_from_name(cls_ClickerDet, "Update", 0);
+        HookMethod(m_cu, (void*)hook_ClickerUpdate, (void**)&orig_ClickerUpdate, "ClickerDetector.Update");
+
+        MethodInfo* m_ca = g_il2cpp.class_get_method_from_name(cls_ClickerDet, "Awake", 0);
+        HookMethod(m_ca, (void*)hook_ClickerAwake, (void**)&orig_ClickerAwake, "ClickerDetector.Awake");
+    }
+
+    // CheatDetectedBanner hooks
+    if (cls_CheatBanner) {
+        MethodInfo* m_ba = g_il2cpp.class_get_method_from_name(cls_CheatBanner, "Awake", 0);
+        HookMethod(m_ba, (void*)hook_BannerAwake, (void**)&orig_BannerAwake, "CheatDetectedBanner.Awake");
+
+        MethodInfo* m_bu = g_il2cpp.class_get_method_from_name(cls_CheatBanner, "Update", 0);
+        HookMethod(m_bu, (void*)hook_BannerUpdate, (void**)&orig_BannerUpdate, "CheatDetectedBanner.Update");
+    }
+
+    // Transform.LookAt(Transform target) → param_count = 1
+    if (cls_Transform) {
+        meth_Transform_LookAt = g_il2cpp.class_get_method_from_name(cls_Transform, "LookAt", 1);
+    }
+
+    g_il2cpp.ready   = true;
+    g_cheat.initialized = true;
+    PG3D_Log("[pg3d_tweak] Iniciado com sucesso (log em: %s)", PG3D_LogPath());
+    return nullptr;
+}
+
+// ============================================================
+//  API pública
+// ============================================================
+void HookManager_Init(void) {
+    pthread_t t;
+    pthread_create(&t, nullptr, InitThread, nullptr);
+    pthread_detach(t);
+}
+
+bool HookManager_IsReady(void) {
+    return g_cheat.initialized;
+}
+
+// ============================================================
+//  Helpers exportados para o Menu (ESP drawing)
+// ============================================================
+
+// Copia snapshot dos players para o caller (thread-safe)
+extern "C" void Players_GetSnapshot(Il2CppObject** buf, int* count, int maxBuf) {
+    pthread_mutex_lock(&s_playerMtx);
+    int n = (int)std::min((size_t)maxBuf, s_players.size());
+    for (int i = 0; i < n; i++) buf[i] = s_players[i];
+    *count = n;
+    pthread_mutex_unlock(&s_playerMtx);
+}
+
+extern "C" Il2CppObject* Player_GetLocalPlayer(void) {
+    return s_localPlayer;
+}
+
+extern "C" Il2CppObject* Camera_GetMain(void) {
+    return GetMainCamera();
+}
+
+extern "C" bool Camera_WorldToScreen_ext(Il2CppObject* cam, Vector3 world, Vector3* out) {
+    return WorldToScreen(cam, world, *out);
+}
+
+extern "C" Vector3 Transform_GetPos_ext(Il2CppObject* tr) {
+    return GetTransformPosition(tr);
+}
+
+// Lê nickname via TextMesh.text icall
+static MethodInfo* meth_TextMesh_getText = nullptr;
+// Linkage C++ normal (não extern "C"): std::string não é ABI-compatível com C
+// no retorno por valor. A declaração em Menu.mm já está fora do bloco extern "C".
+std::string Player_GetNickname(Il2CppObject* player) {
+    if (!player) return "";
+    // nickLabel @ PlayerMove::nickLabel é um UnityEngine.TextMesh
+    Il2CppObject* lbl = Field<Il2CppObject*>(player, PlayerMove::nickLabel);
+    if (!lbl) return "";
+    if (!meth_TextMesh_getText) {
+        // Busca lazy na classe TextMesh
+        if (!g_il2cpp.ready) return "";
+        Il2CppDomain*   dom = g_il2cpp.domain_get();
+        Il2CppAssembly* asm_ue = g_il2cpp.domain_assembly_open(dom, "UnityEngine.TextRenderingModule");
+        if (!asm_ue) return "";
+        Il2CppImage* img = g_il2cpp.assembly_get_image(asm_ue);
+        Il2CppClass* cls = g_il2cpp.class_from_name(img, "UnityEngine", "TextMesh");
+        if (cls) meth_TextMesh_getText = g_il2cpp.class_get_method_from_name(cls, "get_text", 0);
+    }
+    if (!meth_TextMesh_getText) return "";
+    void* ex = nullptr;
+    Il2CppObject* ret = g_il2cpp.runtime_invoke(meth_TextMesh_getText, lbl, nullptr, &ex);
+    if (!ret) return "";
+    return Il2CppStringToStd(reinterpret_cast<Il2CppString*>(ret));
+}
+
+// Lê health do player via PlayerDamageable (campo a 0x778 em Player_move_c)
+// PlayerDamageable herda de MonoBehaviour; seu campo health está em BaseDummy @ 0x20
+// ou em PlayerDamageable diretamente – usamos o BaseDummy offset.
+extern "C" float Player_GetHealth(Il2CppObject* player) {
+    if (!player) return 0.0f;
+    Il2CppObject* damageable = Field<Il2CppObject*>(player, 0x778); // PlayerDamageable
+    if (!damageable) return 0.0f;
+    return Field<float>(damageable, BaseDummyOff::health);
+}
+
+extern "C" bool Player_IsLocal(Il2CppObject* player) {
+    return player == s_localPlayer;
+}
