@@ -1,7 +1,7 @@
 THEOS_PACKAGE_DIR_NAME = packages
 export TARGET = iphone:clang:16.5:14.0
 
-ARCHS  := arm64
+ARCHS = arm64 arm64e
 
 include $(THEOS)/makefiles/common.mk
 
@@ -14,6 +14,8 @@ pg3d_tweak_FILES += pg3d_tweak/HookManager.mm
 pg3d_tweak_CFLAGS  = -fobjc-arc -std=c++17
 pg3d_tweak_CCFLAGS = -std=c++17
 pg3d_tweak_LDFLAGS = -lsubstrate
+
+PG3DCheat_BUNDLE_ID := zombiegun3d
 
 pg3d_tweak_FRAMEWORKS = UIKit CoreGraphics Foundation
 
