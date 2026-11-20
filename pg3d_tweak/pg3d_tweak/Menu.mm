@@ -65,6 +65,7 @@ std::string Player_GetNickname(Il2CppObject* player);
     for (int i = 0; i < count; i++) {
         Il2CppObject* p = buf[i];
         if (!p || p == local) continue;
+        if (!Player_PassesFilters(p)) continue; // teamcheck / minRange / wallcheck (mesma lógica do aimbot)
 
         // Posição da cabeça e dos pés
         Il2CppObject* headTr = Field<Il2CppObject*>(p, PlayerMove::headTransform);
@@ -178,6 +179,10 @@ std::string Player_GetNickname(Il2CppObject* player);
 @property (nonatomic, strong) MenuWindow*   window;
 @property (nonatomic, strong) UIView*       panel;
 @property (nonatomic, strong) UIButton*     toggleBtn;
+// Botão flutuante independente do painel/menu: alterna g_cheat.aimLock
+// (trava a mira em quem estiver dentro da FOV) sem precisar abrir o menu.
+// Fica sempre visível e pode ser arrastado como o botão ☰.
+@property (nonatomic, strong) UIButton*     lockBtn;
 @property (nonatomic, strong) ESPView*      espView;
 @property (nonatomic, strong) CADisplayLink* displayLink;
 @property (nonatomic, assign) BOOL          panelVisible;
@@ -260,8 +265,25 @@ std::string Player_GetNickname(Il2CppObject* player);
     [self.toggleBtn addGestureRecognizer:pan];
     [vc.view addSubview:self.toggleBtn];
 
+    // Botão flutuante de AimLock (fora do menu, sempre visível e arrastável).
+    // Toca para ligar/desligar; a borda fica verde quando ativo.
+    self.lockBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.lockBtn.frame = CGRectMake(10, 134, 44, 44); // logo abaixo do ☰ (80+44+10)
+    self.lockBtn.backgroundColor = [UIColor colorWithRed:0.1 green:0.1 blue:0.1 alpha:0.75];
+    self.lockBtn.layer.cornerRadius = 22;
+    self.lockBtn.layer.borderWidth  = 2;
+    [self.lockBtn setTitle:@"🎯" forState:UIControlStateNormal];
+    self.lockBtn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    [self.lockBtn addTarget:self action:@selector(toggleLockButton)
+           forControlEvents:UIControlEventTouchUpInside];
+    UIPanGestureRecognizer* panLock = [[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(handleDrag:)];
+    [self.lockBtn addGestureRecognizer:panLock];
+    [vc.view addSubview:self.lockBtn];
+    [self refreshLockButtonAppearance];
+
     // Painel de menu
-    CGFloat pw = 200, ph = 290;
+    CGFloat pw = 200, ph = 404;
     self.panel = [[UIView alloc] initWithFrame:CGRectMake(60, 60, pw, ph)];
     self.panel.backgroundColor   = [UIColor colorWithRed:0.05 green:0.05 blue:0.1 alpha:0.88];
     self.panel.layer.cornerRadius = 12;
@@ -295,12 +317,15 @@ std::string Player_GetNickname(Il2CppObject* player);
     [self.panel addSubview:title];
     y += 32;
 
-    // Helper para criar toggle
-    auto makeToggle = [&](NSString* label, BOOL initVal, SEL sel) {
+    // Helper para criar toggle. tag é opcional (0 = sem tag); usado para
+    // localizar o switch de AimLock depois e sincronizá-lo com o botão
+    // flutuante fora do menu.
+    auto makeToggle = [&](NSString* label, BOOL initVal, SEL sel, NSInteger tag) {
         UISwitch* sw = [[UISwitch alloc] initWithFrame:CGRectMake(pw - 55, y, 51, 31)];
         sw.on = initVal;
         sw.onTintColor = [UIColor colorWithRed:1 green:0.3 blue:0.3 alpha:1];
         sw.transform = CGAffineTransformMakeScale(0.75, 0.75);
+        sw.tag = tag;
         [sw addTarget:self action:sel forControlEvents:UIControlEventValueChanged];
         [self.panel addSubview:sw];
 
@@ -312,10 +337,12 @@ std::string Player_GetNickname(Il2CppObject* player);
         y += 36;
     };
 
-    makeToggle(@"Aimbot",    g_cheat.aimbot,    @selector(toggleAimbot:));
-    makeToggle(@"AimLock",   g_cheat.aimLock,   @selector(toggleAimLock:));
-    makeToggle(@"ESP",       g_cheat.esp,        @selector(toggleESP:));
-    makeToggle(@"AC Bypass", g_cheat.acBypass,  @selector(toggleAC:));
+    makeToggle(@"Aimbot",     g_cheat.aimbot,     @selector(toggleAimbot:),    0);
+    makeToggle(@"AimLock",    g_cheat.aimLock,    @selector(toggleAimLock:),   101);
+    makeToggle(@"ESP",        g_cheat.esp,        @selector(toggleESP:),       0);
+    makeToggle(@"AC Bypass",  g_cheat.acBypass,   @selector(toggleAC:),        0);
+    makeToggle(@"Team Check", g_cheat.teamCheck,  @selector(toggleTeamCheck:), 0);
+    makeToggle(@"Wall Check", g_cheat.wallCheck,  @selector(toggleWallCheck:), 0);
 
     // FOV slider
     UILabel* fovLbl = [[UILabel alloc] initWithFrame:CGRectMake(10, y, pw-20, 18)];
@@ -336,6 +363,27 @@ std::string Player_GetNickname(Il2CppObject* player);
     [self.panel addSubview:sl];
     y += 32;
 
+    // Minimum range slider (metros; 0 = desabilitado)
+    UILabel* rangeLbl = [[UILabel alloc] initWithFrame:CGRectMake(10, y, pw-20, 18)];
+    rangeLbl.textColor = [UIColor lightGrayColor];
+    rangeLbl.font = [UIFont systemFontOfSize:11];
+    rangeLbl.text = (g_cheat.minRange > 0.0f)
+        ? [NSString stringWithFormat:@"Min Range: %.0fm", g_cheat.minRange]
+        : @"Min Range: off";
+    rangeLbl.tag = 102;
+    [self.panel addSubview:rangeLbl];
+    y += 20;
+
+    UISlider* rangeSl = [[UISlider alloc] initWithFrame:CGRectMake(10, y, pw-20, 28)];
+    rangeSl.minimumValue = 0.0f;
+    rangeSl.maximumValue = 50.0f;
+    rangeSl.value = g_cheat.minRange;
+    rangeSl.minimumTrackTintColor = [UIColor colorWithRed:1 green:0.3 blue:0.3 alpha:1];
+    [rangeSl addTarget:self action:@selector(rangeChanged:)
+      forControlEvents:UIControlEventValueChanged];
+    [self.panel addSubview:rangeSl];
+    y += 32;
+
     // Fechar
     UIButton* closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     closeBtn.frame = CGRectMake(pw/2 - 40, y, 80, 28);
@@ -354,14 +402,44 @@ std::string Player_GetNickname(Il2CppObject* player);
 }
 
 - (void)toggleAimbot:(UISwitch*)sw { g_cheat.aimbot  = sw.on; }
-- (void)toggleAimLock:(UISwitch*)sw{ g_cheat.aimLock  = sw.on; }
+- (void)toggleAimLock:(UISwitch*)sw{
+    g_cheat.aimLock  = sw.on;
+    [self refreshLockButtonAppearance]; // mantém o botão flutuante em sincronia
+}
 - (void)toggleESP:(UISwitch*)sw    { g_cheat.esp      = sw.on; }
 - (void)toggleAC:(UISwitch*)sw     { g_cheat.acBypass = sw.on; }
+- (void)toggleTeamCheck:(UISwitch*)sw { g_cheat.teamCheck = sw.on; }
+- (void)toggleWallCheck:(UISwitch*)sw { g_cheat.wallCheck = sw.on; }
 
 - (void)fovChanged:(UISlider*)sl {
     g_cheat.aimbotFov = sl.value;
     UILabel* lbl = (UILabel*)[self.panel viewWithTag:100];
     if (lbl) lbl.text = [NSString stringWithFormat:@"Aim FOV: %.0f°", g_cheat.aimbotFov];
+}
+
+- (void)rangeChanged:(UISlider*)sl {
+    g_cheat.minRange = sl.value;
+    UILabel* lbl = (UILabel*)[self.panel viewWithTag:102];
+    if (lbl) lbl.text = (g_cheat.minRange > 0.0f)
+        ? [NSString stringWithFormat:@"Min Range: %.0fm", g_cheat.minRange]
+        : @"Min Range: off";
+}
+
+// ---- Botão flutuante de AimLock (fora do menu) ----
+- (void)toggleLockButton {
+    g_cheat.aimLock = !g_cheat.aimLock;
+    [self refreshLockButtonAppearance];
+    // Mantém o switch "AimLock" dentro do painel em sincronia, se o painel
+    // já foi montado (buildMenuItems roda antes do primeiro uso do botão).
+    UISwitch* sw = (UISwitch*)[self.panel viewWithTag:101];
+    if ([sw isKindOfClass:[UISwitch class]]) [sw setOn:g_cheat.aimLock animated:YES];
+}
+
+- (void)refreshLockButtonAppearance {
+    if (!self.lockBtn) return;
+    UIColor* active   = [UIColor colorWithRed:0.2 green:1.0 blue:0.3 alpha:1];
+    UIColor* inactive = [UIColor colorWithRed:1   green:0.3 blue:0.3 alpha:1];
+    self.lockBtn.layer.borderColor = (g_cheat.aimLock ? active : inactive).CGColor;
 }
 
 // ---- Drag do botão ----

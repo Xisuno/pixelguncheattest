@@ -32,7 +32,10 @@
 //  Globals
 // ============================================================
 Il2CppAPI    g_il2cpp      = {};
-CheatState   g_cheat       = { false, false, 15.0f, false, false, true, false };
+// Ordem tem que bater exatamente com CheatState em HookManager.h:
+// aimbot, aimLock, aimbotFov, esp, espSkeleton, acBypass, teamCheck,
+// wallCheck, minRange, initialized.
+CheatState   g_cheat       = { false, false, 15.0f, false, false, true, false, false, 0.0f, false };
 
 // ============================================================
 //  Log de diagnóstico (NSLog + arquivo)
@@ -78,6 +81,27 @@ static Il2CppClass* cls_CheatBanner   = nullptr;
 static Il2CppClass* cls_Camera        = nullptr;
 static Il2CppClass* cls_Transform     = nullptr;
 static Il2CppClass* cls_Object        = nullptr;
+// UnityEngine.Behaviour.get_enabled() — usado pelo teamcheck para ler o
+// estado (enabled/disabled) dos componentes OutlineEffectComponent que o
+// próprio jogo já usa para colorir aliado vs inimigo (PlayerMove::allyOutline
+// / enemyOutline em offsets.h). Não inventamos offset de "time": lemos um
+// sinal que o jogo já calcula.
+static Il2CppClass* cls_Behaviour     = nullptr;
+static MethodInfo*  s_mGetEnabled     = nullptr;
+// UnityEngine.Physics.Raycast — usado pelo wallcheck.
+// ATENÇÃO (assunção não confirmada em runtime): Physics tem várias
+// sobrecargas de Raycast; pegamos a primeira com param_count == 3, que
+// deveria ser bool Raycast(Vector3 origin, Vector3 direction, float
+// maxDistance). Isso NÃO foi validado contra o dump.cs desta build — há
+// risco real de pegar outra sobrecarga de 3 parâmetros (ex.: a que tem
+// "out RaycastHit" em vez de maxDistance) e o resultado da chamada ficar
+// sem sentido. Antes de confiar no wallcheck: ativar wallCheck sozinho,
+// ficar atrás de uma parede sólida e confirmar no log/visualmente que o
+// ESP/aimbot some; se o comportamento for errático, resolver a sobrecarga
+// certa via il2cpp_method_get_param (tipo de cada parâmetro) em vez de
+// param_count.
+static Il2CppClass* cls_Physics       = nullptr;
+static MethodInfo*  s_mRaycast        = nullptr;
 
 // Icalls Unity que usamos para Transform.position e Camera.WorldToScreenPoint
 typedef void (*fn_Transform_GetPos)(void* tr, Vector3* out);
@@ -263,6 +287,100 @@ static bool IsLocalPlayer(Il2CppObject* player) {
 
 static Il2CppObject* s_localPlayer = nullptr;
 
+// ============================================================
+//  Teamcheck: lê o estado (enabled) dos componentes de outline que o
+//  próprio jogo já usa para pintar aliado (allyOutline) vs inimigo
+//  (enemyOutline). Não existe offset de "time" confirmado no dump.cs
+//  fornecido, então não inventamos um — usamos um sinal que já está no
+//  objeto e é medido (offsets.h: PlayerMove::allyOutline/enemyOutline).
+// ============================================================
+enum class TeamStatus { Unknown, Ally, Enemy };
+
+static bool GetBehaviourEnabled(Il2CppObject* component) {
+    if (!component || !s_mGetEnabled || !g_il2cpp.runtime_invoke) return false;
+    void* ex = nullptr;
+    Il2CppObject* ret = g_il2cpp.runtime_invoke(s_mGetEnabled, component, nullptr, &ex);
+    if (!ret || ex) return false;
+    return Field<bool>(ret, 0x10); // bool boxed
+}
+
+static TeamStatus GetTeamStatus(Il2CppObject* player) {
+    if (!player) return TeamStatus::Unknown;
+    Il2CppObject* allyC  = Field<Il2CppObject*>(player, PlayerMove::allyOutline);
+    Il2CppObject* enemyC = Field<Il2CppObject*>(player, PlayerMove::enemyOutline);
+    bool allyEnabled  = GetBehaviourEnabled(allyC);
+    bool enemyEnabled = GetBehaviourEnabled(enemyC);
+    if (enemyEnabled && !allyEnabled) return TeamStatus::Enemy;
+    if (allyEnabled && !enemyEnabled) return TeamStatus::Ally;
+    // Ambos ligados, ambos desligados, ou componentes nulos: ambíguo.
+    // Loga uma vez para não gerar ruído por frame.
+    static bool s_ambiguousLogged = false;
+    if (!s_ambiguousLogged) {
+        s_ambiguousLogged = true;
+        PG3D_Log("[pg3d_tweak] TEAMCHECK: status ambiguo para player=%p allyC=%p(%d) enemyC=%p(%d) — "
+                 "teamcheck vai tratar como inimigo (fail-open) ate confirmar em jogo",
+                 (void*)player, (void*)allyC, (int)allyEnabled, (void*)enemyC, (int)enemyEnabled);
+    }
+    return TeamStatus::Unknown;
+}
+
+// ============================================================
+//  Wallcheck: Physics.Raycast entre a cabeça do player local e a cabeça
+//  do alvo. true = bloqueado (há algo no meio). Ver aviso sobre a
+//  sobrecarga de Raycast assumida, junto da declaração de s_mRaycast.
+// ============================================================
+static bool RaycastBlocked(Vector3 from, Vector3 to) {
+    if (!s_mRaycast || !g_il2cpp.runtime_invoke) return false; // sem API -> falha aberto (não bloqueia)
+    Vector3 dir = { to.x - from.x, to.y - from.y, to.z - from.z };
+    float dist = sqrtf(dir.x*dir.x + dir.y*dir.y + dir.z*dir.z);
+    if (dist < 0.01f) return false;
+    dir.x /= dist; dir.y /= dist; dir.z /= dist;
+    void* args[3] = { &from, &dir, &dist };
+    void* ex = nullptr;
+    Il2CppObject* ret = g_il2cpp.runtime_invoke(s_mRaycast, nullptr, args, &ex);
+    if (!ret || ex) return false; // chamada falhou -> falha aberto
+    return Field<bool>(ret, 0x10);
+}
+
+// ============================================================
+//  Filtro único usado pelo aimbot (SelectAimTarget) e pelo ESP (Menu.mm),
+//  para que os dois concordem sobre quem é um alvo válido.
+// ============================================================
+extern "C" bool Player_PassesFilters(Il2CppObject* player) {
+    if (!player || player == s_localPlayer) return false;
+
+    if (g_cheat.teamCheck) {
+        if (GetTeamStatus(player) == TeamStatus::Ally) return false;
+        // Enemy ou Unknown: passa (fail-open — nunca escondemos um inimigo
+        // real por causa de um status ambíguo).
+    }
+
+    if (g_cheat.minRange > 0.0f && s_localPlayer) {
+        Il2CppObject* myTr    = Field<Il2CppObject*>(s_localPlayer, PlayerMove::myPlayerTransform);
+        Il2CppObject* theirTr = Field<Il2CppObject*>(player,        PlayerMove::myPlayerTransform);
+        if (myTr && theirTr) {
+            Vector3 myPos    = GetTransformPosition(myTr);
+            Vector3 theirPos = GetTransformPosition(theirTr);
+            float dx = theirPos.x - myPos.x, dy = theirPos.y - myPos.y, dz = theirPos.z - myPos.z;
+            float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+            if (dist < g_cheat.minRange) return false;
+        }
+        // Sem Transform resolvido: não dá para medir distância -> não filtra.
+    }
+
+    if (g_cheat.wallCheck && s_localPlayer) {
+        Il2CppObject* myHead    = Field<Il2CppObject*>(s_localPlayer, PlayerMove::headTransform);
+        Il2CppObject* theirHead = Field<Il2CppObject*>(player,        PlayerMove::headTransform);
+        if (myHead && theirHead) {
+            Vector3 from = GetTransformPosition(myHead);
+            Vector3 to   = GetTransformPosition(theirHead);
+            if (RaycastBlocked(from, to)) return false;
+        }
+    }
+
+    return true;
+}
+
 struct AimTarget {
     Il2CppObject* player;
     Vector3       screenPos;
@@ -291,6 +409,7 @@ static AimTarget SelectAimTarget(Il2CppObject* camera) {
 
     for (Il2CppObject* p : copy) {
         if (!p || p == s_localPlayer) continue;
+        if (!Player_PassesFilters(p)) continue; // teamcheck / minRange / wallcheck
 
         Il2CppObject* headTr = Field<Il2CppObject*>(p, PlayerMove::headTransform);
         if (!headTr) continue;
@@ -544,9 +663,26 @@ static void* InitThread(void*) {
         cls_Object    = g_il2cpp.class_from_name(img_ue, "UnityEngine", "Object");
     }
 
-    PG3D_Log("[pg3d_tweak] CLASSES: Player_move_c=%p ClickerDetector=%p CheatDetectedBanner=%p | UnityEngine.CoreModule=%p Camera=%p Transform=%p Object=%p",
+    if (img_ue) {
+        cls_Behaviour = g_il2cpp.class_from_name(img_ue, "UnityEngine", "Behaviour");
+        if (cls_Behaviour) s_mGetEnabled = g_il2cpp.class_get_method_from_name(cls_Behaviour, "get_enabled", 0);
+    }
+    PG3D_Log("[pg3d_tweak] CLASSES: Player_move_c=%p ClickerDetector=%p CheatDetectedBanner=%p | UnityEngine.CoreModule=%p Camera=%p Transform=%p Object=%p Behaviour=%p get_enabled=%p",
              (void*)cls_PlayerMove, (void*)cls_ClickerDet, (void*)cls_CheatBanner,
-             (void*)asm_ue, (void*)cls_Camera, (void*)cls_Transform, (void*)cls_Object);
+             (void*)asm_ue, (void*)cls_Camera, (void*)cls_Transform, (void*)cls_Object,
+             (void*)cls_Behaviour, (void*)s_mGetEnabled);
+
+    // UnityEngine.Physics mora em UnityEngine.PhysicsModule, não no CoreModule.
+    {
+        Il2CppAssembly* asm_phys = g_il2cpp.domain_assembly_open(domain, "UnityEngine.PhysicsModule");
+        Il2CppImage*    img_phys = asm_phys ? g_il2cpp.assembly_get_image(asm_phys) : nullptr;
+        if (img_phys) {
+            cls_Physics = g_il2cpp.class_from_name(img_phys, "UnityEngine", "Physics");
+            if (cls_Physics) s_mRaycast = g_il2cpp.class_get_method_from_name(cls_Physics, "Raycast", 3);
+        }
+        PG3D_Log("[pg3d_tweak] PHYSICS: UnityEngine.PhysicsModule=%p Physics=%p Raycast(3 args, NAO CONFIRMADO)=%p",
+                 (void*)asm_phys, (void*)cls_Physics, (void*)s_mRaycast);
+    }
 
     if (!cls_PlayerMove) {
         PG3D_Log("[pg3d_tweak] ERRO: Player_move_c não encontrada");
