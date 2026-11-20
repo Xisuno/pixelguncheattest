@@ -8,6 +8,7 @@
 // Design: internal DLL injetada pelo Theos/Substrate no processo do PG3D.
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <substrate.h>
@@ -229,7 +230,8 @@ static void AimAtTarget(Il2CppObject* localPlayer, Il2CppObject* targetHeadTrans
     Il2CppObject* camContainer = Field<Il2CppObject*>(localPlayer, 0x478); // myCameraContainer @ 0x478
     if (!camContainer || !meth_Transform_LookAt) return;
 
-    Vector3 targetPos = GetTransformPosition(targetHeadTransform);
+    // Transform.LookAt(Transform target) recebe o Transform diretamente via icall/
+    // runtime_invoke; não precisamos da posição em Vector3 aqui.
     void* args[1] = { targetHeadTransform };
     void* ex = nullptr;
     g_il2cpp.runtime_invoke(meth_Transform_LookAt, camContainer, args, &ex);
@@ -496,7 +498,9 @@ extern "C" Vector3 Transform_GetPos_ext(Il2CppObject* tr) {
 
 // Lê nickname via TextMesh.text icall
 static MethodInfo* meth_TextMesh_getText = nullptr;
-extern "C" std::string Player_GetNickname(Il2CppObject* player) {
+// Linkage C++ normal (não extern "C"): std::string não é ABI-compatível com C
+// no retorno por valor. A declaração em Menu.mm já está fora do bloco extern "C".
+std::string Player_GetNickname(Il2CppObject* player) {
     if (!player) return "";
     // nickLabel @ PlayerMove::nickLabel é um UnityEngine.TextMesh
     Il2CppObject* lbl = Field<Il2CppObject*>(player, PlayerMove::nickLabel);
