@@ -349,7 +349,7 @@ std::string Player_GetNickname(Il2CppObject* player);
 // ============================================================
 //  API pública
 // ============================================================
-void Menu_Setup(void) {
+extern "C" void Menu_Setup(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [[PG3DMenuController shared] setup];
     });
