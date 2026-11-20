@@ -1,0 +1,9 @@
+Package: com.mc1h.pg3dtweak
+Name: PG3D Cheat
+Depends: mobilesubstrate
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: PG3D cheat: Aimbot, FOV, AimLock, ESP, AC bypass
+Maintainer: mc1h
+Author: mc1h
+Section: Tweaks
