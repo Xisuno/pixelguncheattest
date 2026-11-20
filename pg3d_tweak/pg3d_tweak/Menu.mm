@@ -161,9 +161,12 @@ std::string Player_GetNickname(Il2CppObject* player);
 // Passa toque para o jogo quando o menu está fechado
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *v = [super hitTest:point withEvent:event];
-    // Se o view que recebeu é a ESPView (userInteractionEnabled=NO) devolve nil
-    // para o iOS repassar ao jogo
-    if ([v isKindOfClass:[ESPView class]]) return nil;
+    // ESPView tem userInteractionEnabled=NO, então o hit-test nunca a devolve:
+    // em área vazia ele devolve a view raiz do rootViewController (ou a própria
+    // janela). Essas áreas têm que repassar o toque para a janela do jogo; só o
+    // botão ☰ e o painel (subviews reais) devem capturar.
+    if (!v || v == self || v == self.rootViewController.view ||
+        [v isKindOfClass:[ESPView class]]) return nil;
     return v;
 }
 @end
