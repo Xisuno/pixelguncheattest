@@ -118,52 +118,101 @@ static void (*orig_BannerUpdate)  (Il2CppObject*, void*)  = nullptr;
 // ============================================================
 //  Helpers de posição/câmera
 // ============================================================
+// Os helpers abaixo chamam MÉTODOS GERENCIADOS via il2cpp_runtime_invoke, em
+// vez de icalls cujos nomes/assinaturas mudam entre versões do Unity.
+// Retorno de value type (Vector3, int) vem BOXED: dados em obj + 0x10.
+static MethodInfo* s_mGetMain = nullptr;   // static Camera.get_main()
+static MethodInfo* s_mW2S     = nullptr;   // Camera.WorldToScreenPoint(Vector3)
+static MethodInfo* s_mGetPos  = nullptr;   // Transform.get_position()
+static MethodInfo* s_mPixW    = nullptr;   // Camera.get_pixelWidth()
+static MethodInfo* s_mPixH    = nullptr;   // Camera.get_pixelHeight()
+
+static Il2CppObject* s_mainCam      = nullptr;
+static int           s_camFrameCnt  = 0;
+static float         s_pixW         = 0.0f; // tamanho do render target da câmera
+static float         s_pixH         = 0.0f;
+
+static void ResolveManagedHelpers() {
+    static bool done = false;
+    if (done || !g_il2cpp.class_get_method_from_name || !cls_Camera || !cls_Transform) return;
+    done = true;
+    s_mGetMain = g_il2cpp.class_get_method_from_name(cls_Camera,    "get_main", 0);
+    s_mW2S     = g_il2cpp.class_get_method_from_name(cls_Camera,    "WorldToScreenPoint", 1);
+    s_mGetPos  = g_il2cpp.class_get_method_from_name(cls_Transform, "get_position", 0);
+    s_mPixW    = g_il2cpp.class_get_method_from_name(cls_Camera,    "get_pixelWidth", 0);
+    s_mPixH    = g_il2cpp.class_get_method_from_name(cls_Camera,    "get_pixelHeight", 0);
+    PG3D_Log("[pg3d_tweak] MANAGED: Camera.get_main=%p WorldToScreenPoint(1)=%p Transform.get_position=%p get_pixelWidth=%p get_pixelHeight=%p",
+             (void*)s_mGetMain, (void*)s_mW2S, (void*)s_mGetPos, (void*)s_mPixW, (void*)s_mPixH);
+}
+
+static float CamPixel(Il2CppObject* cam, MethodInfo* m) {
+    if (!cam || !m || !g_il2cpp.runtime_invoke) return 0.0f;
+    void* ex = nullptr;
+    Il2CppObject* ret = g_il2cpp.runtime_invoke(m, cam, nullptr, &ex);
+    if (!ret || ex) return 0.0f;
+    return (float)Field<int32_t>(ret, 0x10);
+}
+
 static Vector3 GetTransformPosition(Il2CppObject* transform) {
     Vector3 pos = {0,0,0};
-    if (transform && icall_Transform_get_position)
+    if (!transform) return pos;
+    ResolveManagedHelpers();
+    if (s_mGetPos && g_il2cpp.runtime_invoke) {
+        void* ex = nullptr;
+        Il2CppObject* ret = g_il2cpp.runtime_invoke(s_mGetPos, transform, nullptr, &ex);
+        if (ret && !ex) return Field<Vector3>(ret, 0x10);
+    }
+    if (icall_Transform_get_position)
         icall_Transform_get_position(transform, &pos);
     return pos;
 }
 
+// Converte mundo -> coordenadas do overlay UIKit (pontos, origem no canto
+// superior esquerdo). O Unity devolve PIXELS do render target com origem no
+// canto INFERIOR esquerdo; por isso inverte Y e reescala para os pontos da tela.
+// out.z = profundidade (>0 = na frente da câmera).
 static bool WorldToScreen(Il2CppObject* camera, Vector3 world, Vector3& out) {
-    if (!camera || !icall_Camera_WorldToScreen) return false;
-    icall_Camera_WorldToScreen(camera, &world, &out);
-    // se z < 0 está atrás da câmera
-    return out.z > 0.0f;
+    if (!camera) return false;
+    ResolveManagedHelpers();
+    if (!s_mW2S || !g_il2cpp.runtime_invoke) return false;
+    void* args[1] = { &world };
+    void* ex = nullptr;
+    Il2CppObject* ret = g_il2cpp.runtime_invoke(s_mW2S, camera, args, &ex);
+    if (!ret || ex) return false;
+    Vector3 px = Field<Vector3>(ret, 0x10);
+    if (px.z <= 0.0f || !std::isfinite(px.x) || !std::isfinite(px.y)) return false;
+    if (s_pixW <= 0.0f || s_pixH <= 0.0f) return false;
+    CGRect b = [UIScreen mainScreen].bounds;
+    out.x = px.x / s_pixW * (float)b.size.width;
+    out.y = (1.0f - px.y / s_pixH) * (float)b.size.height;
+    out.z = px.z;
+    return true;
 }
-
-// Cache da câmera principal: busca a cada N frames
-static Il2CppObject* s_mainCam      = nullptr;
-static int           s_camFrameCnt  = 0;
 
 static Il2CppObject* GetMainCamera() {
     if (s_camFrameCnt++ < 30 && s_mainCam) return s_mainCam;
     s_camFrameCnt = 0;
-
-    if (!icall_FindObjectsAll || !cls_Camera || !icall_GetType) {
+    ResolveManagedHelpers();
+    if (!s_mGetMain || !g_il2cpp.runtime_invoke) {
         static bool s_camLogged = false;
         if (!s_camLogged) {
             s_camLogged = true;
-            PG3D_Log("[pg3d_tweak] CAMERA: impossivel buscar (FindObjectsAll=%p cls_Camera=%p GetType=%p)",
-                     (void*)icall_FindObjectsAll, (void*)cls_Camera, (void*)icall_GetType);
+            PG3D_Log("[pg3d_tweak] CAMERA: Camera.get_main indisponivel (get_main=%p cls_Camera=%p)",
+                     (void*)s_mGetMain, (void*)cls_Camera);
         }
         return s_mainCam;
     }
-
-    void* camType = icall_GetType(cls_Camera);
-    if (!camType) return s_mainCam;
-
-    Il2CppArray* arr = icall_FindObjectsAll(camType, nullptr);
-    if (!arr) return s_mainCam;
-
-    uintptr_t len = g_il2cpp.array_length(arr);
-    for (uintptr_t i = 0; i < len; i++) {
-        Il2CppObject** elem = reinterpret_cast<Il2CppObject**>(
-            g_il2cpp.array_addr_with_size(arr, sizeof(void*), i));
-        if (!elem || !*elem) continue;
-        // Pega a primeira câmera encontrada (Camera.main não tem icall simples)
-        s_mainCam = *elem;
-        break;
+    void* ex = nullptr;
+    Il2CppObject* cam = g_il2cpp.runtime_invoke(s_mGetMain, nullptr, nullptr, &ex);
+    s_mainCam = (cam && !ex) ? cam : nullptr; // nulo se a câmera sumiu (evita ponteiro velho)
+    if (s_mainCam) {
+        s_pixW = CamPixel(s_mainCam, s_mPixW);
+        s_pixH = CamPixel(s_mainCam, s_mPixH);
+        static bool s_camOk = false;
+        if (!s_camOk) {
+            s_camOk = true;
+            PG3D_Log("[pg3d_tweak] CAMERA: main=%p pixel=%.0fx%.0f", (void*)s_mainCam, s_pixW, s_pixH);
+        }
     }
     return s_mainCam;
 }
@@ -228,9 +277,9 @@ static AimTarget SelectAimTarget(Il2CppObject* camera) {
     // UIScreen.mainScreen.bounds – usamos 1920/2 e 1080/2 como fallback
     // (o overlay corrige antes de desenhar)
     CGRect screen = [UIScreen mainScreen].bounds;
-    CGFloat scale = [UIScreen mainScreen].scale;
-    float cx = (float)(screen.size.width  * scale) * 0.5f;
-    float cy = (float)(screen.size.height * scale) * 0.5f;
+    // WorldToScreen já devolve pontos UIKit (origem topo-esquerdo), sem fator de escala.
+    float cx = (float)screen.size.width  * 0.5f;
+    float cy = (float)screen.size.height * 0.5f;
 
     float fovRad = g_cheat.aimbotFov * (M_PI / 180.0f);
     // Comparação é feita abaixo via sinf(fovRad/2) contra a proporção
