@@ -179,6 +179,7 @@ std::string Player_GetNickname(Il2CppObject* player);
 @property (nonatomic, strong) CADisplayLink* displayLink;
 @property (nonatomic, assign) BOOL          panelVisible;
 @property (nonatomic, assign) CGPoint       dragOffset;
+@property (nonatomic, assign) NSInteger     setupAttempts;
 + (instancetype)shared;
 - (void)setup;
 @end
@@ -192,12 +193,40 @@ std::string Player_GetNickname(Il2CppObject* player);
     return s;
 }
 
-- (void)setup {
-    PG3D_Log("[pg3d_tweak] -[PG3DMenuController setup] entrou");
-    CGRect screen = [UIScreen mainScreen].bounds;
+// O jogo declara UIApplicationSceneManifest: no iOS 13+ uma UIWindow criada
+// sem UIWindowScene pode nunca ser exibida. Procura a cena ativa.
+- (UIWindowScene*)activeWindowScene {
+    UIWindowScene* fallback = nil;
+    for (UIScene* sc in [UIApplication sharedApplication].connectedScenes) {
+        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+        if (sc.activationState == UISceneActivationStateForegroundActive)
+            return (UIWindowScene*)sc;
+        if (!fallback) fallback = (UIWindowScene*)sc;
+    }
+    return fallback;
+}
 
-    // Janela overlay
-    self.window = [[MenuWindow alloc] initWithFrame:screen];
+- (void)setup {
+    if (self.window) return; // já criada
+    PG3D_Log("[pg3d_tweak] -[PG3DMenuController setup] entrou (tentativa %ld)", (long)self.setupAttempts);
+
+    UIWindowScene* scene = [self activeWindowScene];
+    if (!scene && self.setupAttempts < 15) {
+        // Cena ainda não conectada: tenta de novo em 1s (até 15x).
+        self.setupAttempts++;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [self setup]; });
+        return;
+    }
+    PG3D_Log("[pg3d_tweak] windowScene=%p state=%ld", (void*)scene,
+             scene ? (long)scene.activationState : -1L);
+
+    CGRect screen = scene ? scene.coordinateSpace.bounds : [UIScreen mainScreen].bounds;
+
+    // Janela overlay (ligada à cena quando existe; sem cena só como último recurso)
+    self.window = scene ? [[MenuWindow alloc] initWithWindowScene:scene]
+                        : [[MenuWindow alloc] initWithFrame:screen];
+    self.window.frame = screen;
     self.window.windowLevel       = UIWindowLevelAlert + 1;
     self.window.backgroundColor   = [UIColor clearColor];
     self.window.userInteractionEnabled = YES;
