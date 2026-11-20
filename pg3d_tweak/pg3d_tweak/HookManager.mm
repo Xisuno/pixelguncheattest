@@ -182,8 +182,8 @@ static AimTarget SelectAimTarget(Il2CppObject* camera) {
     float cy = (float)(screen.size.height * scale) * 0.5f;
 
     float fovRad = g_cheat.aimbotFov * (M_PI / 180.0f);
-    // cos(fov/2) para comparação com dot product – mais barato que atan2
-    float cosFov = cosf(fovRad * 0.5f);
+    // Comparação é feita abaixo via sinf(fovRad/2) contra a proporção
+    // dist/screenLen (ver loop); não usamos cosFov aqui.
 
     pthread_mutex_lock(&s_playerMtx);
     std::vector<Il2CppObject*> copy = s_players;
