@@ -140,7 +140,15 @@ static Il2CppObject* GetMainCamera() {
     if (s_camFrameCnt++ < 30 && s_mainCam) return s_mainCam;
     s_camFrameCnt = 0;
 
-    if (!icall_FindObjectsAll || !cls_Camera || !icall_GetType) return s_mainCam;
+    if (!icall_FindObjectsAll || !cls_Camera || !icall_GetType) {
+        static bool s_camLogged = false;
+        if (!s_camLogged) {
+            s_camLogged = true;
+            PG3D_Log("[pg3d_tweak] CAMERA: impossivel buscar (FindObjectsAll=%p cls_Camera=%p GetType=%p)",
+                     (void*)icall_FindObjectsAll, (void*)cls_Camera, (void*)icall_GetType);
+        }
+        return s_mainCam;
+    }
 
     void* camType = icall_GetType(cls_Camera);
     if (!camType) return s_mainCam;
@@ -284,6 +292,17 @@ static void AimAtTarget(Il2CppObject* localPlayer, Il2CppObject* targetHeadTrans
 //  Hook: Player_move_c.Update
 // ============================================================
 static void hook_PlayerUpdate(Il2CppObject* self, void* /*unused*/) {
+    {
+        static int s_updCnt = 0;
+        if (s_updCnt++ % 600 == 0) {
+            pthread_mutex_lock(&s_playerMtx);
+            size_t np = s_players.size();
+            pthread_mutex_unlock(&s_playerMtx);
+            PG3D_Log("[pg3d_tweak] UPDATE #%d self=%p local=%p isMineMeth=%p cam=%p players=%zu aimbot=%d esp=%d",
+                     s_updCnt, (void*)self, (void*)s_localPlayer, (void*)meth_isMine,
+                     (void*)s_mainCam, np, (int)g_cheat.aimbot, (int)g_cheat.esp);
+        }
+    }
     // Registra este player na lista global
     AddPlayer(self);
 
@@ -359,14 +378,15 @@ static void* ResolveIcall(const char* name) {
 // ============================================================
 //  Instala hook MSHookFunction num método IL2CPP
 // ============================================================
-static bool HookMethod(MethodInfo* method, void* hook, void** orig) {
-    if (!method) return false;
+static bool HookMethod(MethodInfo* method, void* hook, void** orig, const char* name = "?") {
+    if (!method) { PG3D_Log("[pg3d_tweak] HOOK %s: MethodInfo NULL (metodo nao encontrado)", name); return false; }
     // O ponteiro para o código do método fica em method->methodPointer
     // Na struct MethodInfo do IL2CPP:
     //   offset 0x0 = Il2CppMethodPointer methodPointer
     void* methodPtr = *reinterpret_cast<void**>(method);
-    if (!methodPtr) return false;
+    if (!methodPtr) { PG3D_Log("[pg3d_tweak] HOOK %s: methodPointer NULL", name); return false; }
     MSHookFunction(methodPtr, hook, orig);
+    PG3D_Log("[pg3d_tweak] HOOK %s: instalado em %p (orig=%p)", name, methodPtr, orig ? *orig : nullptr);
     return true;
 }
 
@@ -445,6 +465,12 @@ static void* InitThread(void*) {
         return nullptr;
     }
 
+    PG3D_Log("[pg3d_tweak] API: assembly_get_image=%p get_method=%p get_field=%p array_len=%p array_addr=%p string_new=%p resolve_icall=%p",
+             (void*)g_il2cpp.assembly_get_image, (void*)g_il2cpp.class_get_method_from_name,
+             (void*)g_il2cpp.class_get_field_from_name, (void*)g_il2cpp.array_length,
+             (void*)g_il2cpp.array_addr_with_size, (void*)g_il2cpp.string_new,
+             (void*)g_il2cpp.resolve_icall);
+
     // 3. Obtém a imagem Assembly-CSharp.dll
     Il2CppDomain*   domain = g_il2cpp.domain_get();
     Il2CppAssembly* asm_csharp = g_il2cpp.domain_assembly_open(domain, "Assembly-CSharp");
@@ -469,6 +495,10 @@ static void* InitThread(void*) {
         cls_Object    = g_il2cpp.class_from_name(img_ue, "UnityEngine", "Object");
     }
 
+    PG3D_Log("[pg3d_tweak] CLASSES: Player_move_c=%p ClickerDetector=%p CheatDetectedBanner=%p | UnityEngine.CoreModule=%p Camera=%p Transform=%p Object=%p",
+             (void*)cls_PlayerMove, (void*)cls_ClickerDet, (void*)cls_CheatBanner,
+             (void*)asm_ue, (void*)cls_Camera, (void*)cls_Transform, (void*)cls_Object);
+
     if (!cls_PlayerMove) {
         PG3D_Log("[pg3d_tweak] ERRO: Player_move_c não encontrada");
         return nullptr;
@@ -491,37 +521,54 @@ static void* InitThread(void*) {
     icall_GetType = (fn_GetType) ResolveIcall(
         "UnityEngine.RuntimeTypeHandle::GetRuntimeTypeFromHandle");
 
+    PG3D_Log("[pg3d_tweak] ICALLS: Transform.get_position_Injected=%p Camera.WorldToScreenPoint_Injected=%p Camera.get_fieldOfView=%p Camera.set_fieldOfView=%p Object.FindObjectsOfType_internal=%p RuntimeTypeHandle.GetRuntimeTypeFromHandle=%p",
+             (void*)icall_Transform_get_position, (void*)icall_Camera_WorldToScreen,
+             (void*)icall_Camera_GetFov, (void*)icall_Camera_SetFov,
+             (void*)icall_FindObjectsAll, (void*)icall_GetType);
+
     // 6. Encontra e hooka métodos
     // Player_move_c.Update (sem parâmetros → param_count = 0)
     meth_PlayerUpdate = g_il2cpp.class_get_method_from_name(cls_PlayerMove, "Update", 0);
-    HookMethod(meth_PlayerUpdate, (void*)hook_PlayerUpdate, (void**)&orig_PlayerUpdate);
+    HookMethod(meth_PlayerUpdate, (void*)hook_PlayerUpdate, (void**)&orig_PlayerUpdate, "Player_move_c.Update");
 
     // isMine getter no PhotonView
     // PhotonView está em Photon.MonoBehaviour derivado – buscamos a imagem certa
-    Il2CppAssembly* asm_photon = g_il2cpp.domain_assembly_open(domain, "Photon3Unity3D");
-    if (asm_photon) {
-        Il2CppImage* img_photon = g_il2cpp.assembly_get_image(asm_photon);
-        Il2CppClass* cls_pv = g_il2cpp.class_from_name(img_photon, "", "PhotonView");
-        if (cls_pv)
-            meth_isMine = g_il2cpp.class_get_method_from_name(cls_pv, "get_isMine", 0);
+    // PhotonView: a assembly depende da versao do PUN; sonda candidatas e loga
+    // o resultado de cada uma (nenhuma e assumida como correta).
+    {
+        static const char* kPhotonAsms[]  = { "Assembly-CSharp-firstpass", "Photon3Unity3D", "Assembly-CSharp" };
+        static const char* kIsMineNames[] = { "get_isMine", "get_IsMine" };
+        for (const char* an : kPhotonAsms) {
+            Il2CppAssembly* a = g_il2cpp.domain_assembly_open(domain, an);
+            Il2CppImage* im = a ? g_il2cpp.assembly_get_image(a) : nullptr;
+            Il2CppClass* cpv = im ? g_il2cpp.class_from_name(im, "", "PhotonView") : nullptr;
+            PG3D_Log("[pg3d_tweak] PHOTON: assembly=%s asm=%p PhotonView=%p", an, (void*)a, (void*)cpv);
+            if (!cpv) continue;
+            for (const char* mn : kIsMineNames) {
+                MethodInfo* m = g_il2cpp.class_get_method_from_name(cpv, mn, 0);
+                PG3D_Log("[pg3d_tweak] PHOTON:   %s = %p", mn, (void*)m);
+                if (m && !meth_isMine) meth_isMine = m;
+            }
+        }
+        PG3D_Log("[pg3d_tweak] PHOTON: meth_isMine final=%p", (void*)meth_isMine);
     }
 
     // ClickerDetector hooks
     if (cls_ClickerDet) {
         MethodInfo* m_cu = g_il2cpp.class_get_method_from_name(cls_ClickerDet, "Update", 0);
-        HookMethod(m_cu, (void*)hook_ClickerUpdate, (void**)&orig_ClickerUpdate);
+        HookMethod(m_cu, (void*)hook_ClickerUpdate, (void**)&orig_ClickerUpdate, "ClickerDetector.Update");
 
         MethodInfo* m_ca = g_il2cpp.class_get_method_from_name(cls_ClickerDet, "Awake", 0);
-        HookMethod(m_ca, (void*)hook_ClickerAwake, (void**)&orig_ClickerAwake);
+        HookMethod(m_ca, (void*)hook_ClickerAwake, (void**)&orig_ClickerAwake, "ClickerDetector.Awake");
     }
 
     // CheatDetectedBanner hooks
     if (cls_CheatBanner) {
         MethodInfo* m_ba = g_il2cpp.class_get_method_from_name(cls_CheatBanner, "Awake", 0);
-        HookMethod(m_ba, (void*)hook_BannerAwake, (void**)&orig_BannerAwake);
+        HookMethod(m_ba, (void*)hook_BannerAwake, (void**)&orig_BannerAwake, "CheatDetectedBanner.Awake");
 
         MethodInfo* m_bu = g_il2cpp.class_get_method_from_name(cls_CheatBanner, "Update", 0);
-        HookMethod(m_bu, (void*)hook_BannerUpdate, (void**)&orig_BannerUpdate);
+        HookMethod(m_bu, (void*)hook_BannerUpdate, (void**)&orig_BannerUpdate, "CheatDetectedBanner.Update");
     }
 
     // Transform.LookAt(Transform target) → param_count = 1
