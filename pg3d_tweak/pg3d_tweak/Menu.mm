@@ -43,15 +43,36 @@ std::string Player_GetNickname(Il2CppObject* player);
         self.backgroundColor   = [UIColor clearColor];
         self.userInteractionEnabled = NO;
         self.opaque = NO;
+        // Acompanha o tamanho da janela (rotação) e redesenha quando muda.
+        self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        self.contentMode = UIViewContentModeRedraw;
     }
     return self;
 }
 
-- (void)drawRect:(CGRect)rect {
-    if (!g_cheat.esp || !HookManager_IsReady()) return;
+// Informa ao HookManager o retângulo real do overlay: projeção, centro de mira e
+// círculo de FOV passam a usar exatamente o mesmo espaço de coordenadas.
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    Overlay_SetSize((float)self.bounds.size.width, (float)self.bounds.size.height);
+}
 
+- (void)drawRect:(CGRect)rect {
     CGContextRef ctx = UIGraphicsGetCurrentContext();
     if (!ctx) return;
+
+    // Círculo de FOV da mira (independe do ESP). Verde enquanto há alvo travado.
+    if (g_cheat.showFov && (g_cheat.aimbot || g_cheat.aimLock || g_cheat.lockButton)) {
+        CGFloat r  = (CGFloat)Aim_FovRadiusPoints();
+        CGPoint c  = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
+        UIColor* col = g_cheat.aimLock ? [UIColor colorWithRed:0.2 green:1.0 blue:0.3 alpha:0.9]
+                                       : [UIColor colorWithWhite:1.0 alpha:0.8];
+        CGContextSetStrokeColorWithColor(ctx, col.CGColor);
+        CGContextSetLineWidth(ctx, 1.5f);
+        CGContextStrokeEllipseInRect(ctx, CGRectMake(c.x - r, c.y - r, r * 2.0, r * 2.0));
+    }
+
+    if (!g_cheat.esp || !HookManager_IsReady()) return;
 
     Il2CppObject* camera = Camera_GetMain();
     if (!camera) return;
@@ -188,6 +209,8 @@ std::string Player_GetNickname(Il2CppObject* player);
 @property (nonatomic, assign) BOOL          panelVisible;
 @property (nonatomic, assign) CGPoint       dragOffset;
 @property (nonatomic, assign) NSInteger     setupAttempts;
+@property (nonatomic, assign) BOOL          wasDrawing;   // houve desenho no último tick (para limpar ao desligar)
+@property (nonatomic, assign) BOOL          lockShownOn;  // último estado de aimLock refletido no botão/switch
 + (instancetype)shared;
 - (void)setup;
 @end
@@ -247,6 +270,8 @@ std::string Player_GetNickname(Il2CppObject* player);
     // ESPView ocupa a tela toda
     self.espView = [[ESPView alloc] initWithFrame:screen];
     [vc.view addSubview:self.espView];
+    // Mesma regra do init do ESPView: segue o tamanho da view raiz.
+    self.espView.frame = vc.view.bounds;
 
     // Botão flutuante para abrir menu
     self.toggleBtn = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -280,10 +305,13 @@ std::string Player_GetNickname(Il2CppObject* player);
         initWithTarget:self action:@selector(handleDrag:)];
     [self.lockBtn addGestureRecognizer:panLock];
     [vc.view addSubview:self.lockBtn];
+    self.lockBtn.hidden = !g_cheat.lockButton;
     [self refreshLockButtonAppearance];
 
     // Painel de menu
-    CGFloat pw = 200, ph = 404;
+    // Painel com rolagem interna: cabe em tela landscape mesmo com todas as opções.
+    CGFloat pw = 220;
+    CGFloat ph = MIN(330.0, MAX(200.0, MIN(screen.size.width, screen.size.height) - 70.0));
     self.panel = [[UIView alloc] initWithFrame:CGRectMake(60, 60, pw, ph)];
     self.panel.backgroundColor   = [UIColor colorWithRed:0.05 green:0.05 blue:0.1 alpha:0.88];
     self.panel.layer.cornerRadius = 12;
@@ -305,21 +333,27 @@ std::string Player_GetNickname(Il2CppObject* player);
 }
 
 - (void)buildMenuItems {
-    CGFloat y = 10;
     CGFloat pw = self.panel.bounds.size.width;
+    CGFloat ph = self.panel.bounds.size.height;
 
-    // Título
-    UILabel* title = [[UILabel alloc] initWithFrame:CGRectMake(0, y, pw, 28)];
+    // Título (fixo no topo)
+    UILabel* title = [[UILabel alloc] initWithFrame:CGRectMake(0, 8, pw, 28)];
     title.text = @"PG3D Cheat ◈";
     title.textAlignment = NSTextAlignmentCenter;
     title.textColor = [UIColor colorWithRed:1 green:0.4 blue:0.4 alpha:1];
     title.font = [UIFont boldSystemFontOfSize:14];
     [self.panel addSubview:title];
-    y += 32;
 
-    // Helper para criar toggle. tag é opcional (0 = sem tag); usado para
-    // localizar o switch de AimLock depois e sincronizá-lo com o botão
-    // flutuante fora do menu.
+    // Conteúdo rolável
+    UIScrollView* sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 38, pw, ph - 42)];
+    sv.showsVerticalScrollIndicator = YES;
+    sv.alwaysBounceVertical = YES;
+    sv.delaysContentTouches = NO;
+    [self.panel addSubview:sv];
+    CGFloat y = 4;
+
+    // Helper para criar toggle. tag: 101 = switch de AimLock (sincronizado com o
+    // botão flutuante); 1/2/4/8 = bits de parte do corpo (AimPartBit); 0 = sem tag.
     auto makeToggle = [&](NSString* label, BOOL initVal, SEL sel, NSInteger tag) {
         UISwitch* sw = [[UISwitch alloc] initWithFrame:CGRectMake(pw - 55, y, 51, 31)];
         sw.on = initVal;
@@ -327,22 +361,50 @@ std::string Player_GetNickname(Il2CppObject* player);
         sw.transform = CGAffineTransformMakeScale(0.75, 0.75);
         sw.tag = tag;
         [sw addTarget:self action:sel forControlEvents:UIControlEventValueChanged];
-        [self.panel addSubview:sw];
+        [sv addSubview:sw];
 
         UILabel* lbl = [[UILabel alloc] initWithFrame:CGRectMake(10, y, pw - 70, 31)];
         lbl.text = label;
         lbl.textColor = [UIColor whiteColor];
         lbl.font = [UIFont systemFontOfSize:12];
-        [self.panel addSubview:lbl];
-        y += 36;
+        [sv addSubview:lbl];
+        y += 34;
+    };
+    auto makeSection = [&](NSString* text) {
+        UILabel* l = [[UILabel alloc] initWithFrame:CGRectMake(10, y + 2, pw - 20, 16)];
+        l.text = text;
+        l.textColor = [UIColor colorWithRed:1 green:0.6 blue:0.6 alpha:1];
+        l.font = [UIFont boldSystemFontOfSize:10];
+        [sv addSubview:l];
+        y += 20;
     };
 
+    makeSection(@"MIRA");
     makeToggle(@"Aimbot",     g_cheat.aimbot,     @selector(toggleAimbot:),    0);
     makeToggle(@"AimLock",    g_cheat.aimLock,    @selector(toggleAimLock:),   101);
+    makeToggle(@"Botão Lock", g_cheat.lockButton, @selector(toggleLockBtn:),   0);
+    makeToggle(@"Mostrar FOV", g_cheat.showFov,   @selector(toggleShowFov:),   0);
+
+    makeSection(@"PARTE DO CORPO (multi-seleção)");
+    makeToggle(@"Cabeça",  (g_cheat.aimParts & AIM_PART_HEAD)    != 0, @selector(togglePart:), AIM_PART_HEAD);
+    makeToggle(@"Peito",   (g_cheat.aimParts & AIM_PART_CHEST)   != 0, @selector(togglePart:), AIM_PART_CHEST);
+    makeToggle(@"Abdômen", (g_cheat.aimParts & AIM_PART_STOMACH) != 0, @selector(togglePart:), AIM_PART_STOMACH);
+    makeToggle(@"Pernas",  (g_cheat.aimParts & AIM_PART_LEGS)    != 0, @selector(togglePart:), AIM_PART_LEGS);
+
+    makeSection(@"FILTROS / VISUAL");
     makeToggle(@"ESP",        g_cheat.esp,        @selector(toggleESP:),       0);
-    makeToggle(@"AC Bypass",  g_cheat.acBypass,   @selector(toggleAC:),        0);
     makeToggle(@"Team Check", g_cheat.teamCheck,  @selector(toggleTeamCheck:), 0);
     makeToggle(@"Wall Check", g_cheat.wallCheck,  @selector(toggleWallCheck:), 0);
+    // Aviso (só aparece com Wall Check ligado e Physics.Linecast não resolvido)
+    UILabel* wallNote = [[UILabel alloc] initWithFrame:CGRectMake(10, y - 4, pw - 20, 14)];
+    wallNote.textColor = [UIColor colorWithRed:1 green:0.7 blue:0.2 alpha:1];
+    wallNote.font = [UIFont systemFontOfSize:9];
+    wallNote.text = @"Wall Check indisponível neste build";
+    wallNote.tag = 103;
+    wallNote.hidden = YES;
+    [sv addSubview:wallNote];
+    y += 14;
+    makeToggle(@"AC Bypass",  g_cheat.acBypass,   @selector(toggleAC:),        0);
 
     // FOV slider
     UILabel* fovLbl = [[UILabel alloc] initWithFrame:CGRectMake(10, y, pw-20, 18)];
@@ -350,7 +412,7 @@ std::string Player_GetNickname(Il2CppObject* player);
     fovLbl.font = [UIFont systemFontOfSize:11];
     fovLbl.text = [NSString stringWithFormat:@"Aim FOV: %.0f°", g_cheat.aimbotFov];
     fovLbl.tag = 100;
-    [self.panel addSubview:fovLbl];
+    [sv addSubview:fovLbl];
     y += 20;
 
     UISlider* sl = [[UISlider alloc] initWithFrame:CGRectMake(10, y, pw-20, 28)];
@@ -360,7 +422,7 @@ std::string Player_GetNickname(Il2CppObject* player);
     sl.minimumTrackTintColor = [UIColor colorWithRed:1 green:0.3 blue:0.3 alpha:1];
     [sl addTarget:self action:@selector(fovChanged:)
  forControlEvents:UIControlEventValueChanged];
-    [self.panel addSubview:sl];
+    [sv addSubview:sl];
     y += 32;
 
     // Minimum range slider (metros; 0 = desabilitado)
@@ -371,7 +433,7 @@ std::string Player_GetNickname(Il2CppObject* player);
         ? [NSString stringWithFormat:@"Min Range: %.0fm", g_cheat.minRange]
         : @"Min Range: off";
     rangeLbl.tag = 102;
-    [self.panel addSubview:rangeLbl];
+    [sv addSubview:rangeLbl];
     y += 20;
 
     UISlider* rangeSl = [[UISlider alloc] initWithFrame:CGRectMake(10, y, pw-20, 28)];
@@ -381,7 +443,7 @@ std::string Player_GetNickname(Il2CppObject* player);
     rangeSl.minimumTrackTintColor = [UIColor colorWithRed:1 green:0.3 blue:0.3 alpha:1];
     [rangeSl addTarget:self action:@selector(rangeChanged:)
       forControlEvents:UIControlEventValueChanged];
-    [self.panel addSubview:rangeSl];
+    [sv addSubview:rangeSl];
     y += 32;
 
     // Fechar
@@ -392,7 +454,10 @@ std::string Player_GetNickname(Il2CppObject* player);
     closeBtn.titleLabel.font = [UIFont systemFontOfSize:12];
     [closeBtn addTarget:self action:@selector(togglePanel)
        forControlEvents:UIControlEventTouchUpInside];
-    [self.panel addSubview:closeBtn];
+    [sv addSubview:closeBtn];
+    y += 36;
+
+    sv.contentSize = CGSizeMake(pw, y);
 }
 
 // ---- Toggle actions ----
@@ -402,9 +467,38 @@ std::string Player_GetNickname(Il2CppObject* player);
 }
 
 - (void)toggleAimbot:(UISwitch*)sw { g_cheat.aimbot  = sw.on; }
-- (void)toggleAimLock:(UISwitch*)sw{
-    g_cheat.aimLock  = sw.on;
-    [self refreshLockButtonAppearance]; // mantém o botão flutuante em sincronia
+// AimLock = trava (sticky) no jogador que está dentro do círculo de FOV agora.
+// Sem alvo dentro do círculo, o switch volta para desligado.
+- (void)toggleAimLock:(UISwitch*)sw {
+    if (sw.on) {
+        if (!Aim_LockAcquire()) [sw setOn:NO animated:YES];
+    } else {
+        Aim_LockRelease();
+    }
+    [self refreshLockButtonAppearance];
+}
+
+// Multi-seleção de partes do corpo (tag = bit). Sempre fica pelo menos uma marcada.
+- (void)togglePart:(UISwitch*)sw {
+    unsigned char bit  = (unsigned char)sw.tag;
+    unsigned char mask = g_cheat.aimParts;
+    if (sw.on) mask = (unsigned char)(mask | bit);
+    else       mask = (unsigned char)(mask & (unsigned char)~bit);
+    if (mask == 0) { [sw setOn:YES animated:YES]; return; }
+    g_cheat.aimParts = mask;
+}
+
+- (void)toggleShowFov:(UISwitch*)sw { g_cheat.showFov = sw.on; }
+
+// Mostra/esconde o botão flutuante de lock (fora do menu).
+- (void)toggleLockBtn:(UISwitch*)sw {
+    g_cheat.lockButton = sw.on;
+    self.lockBtn.hidden = !sw.on;
+    if (!sw.on && g_cheat.aimLock) {
+        Aim_LockRelease();
+        [self syncAimLockSwitch];
+        [self refreshLockButtonAppearance];
+    }
 }
 - (void)toggleESP:(UISwitch*)sw    { g_cheat.esp      = sw.on; }
 - (void)toggleAC:(UISwitch*)sw     { g_cheat.acBypass = sw.on; }
@@ -415,6 +509,9 @@ std::string Player_GetNickname(Il2CppObject* player);
 - (void)toggleWallCheck:(UISwitch*)sw {
     g_cheat.wallCheck = sw.on;
     Diag_LogFilterStatus("toggleWallCheck");
+    UILabel* note = (UILabel*)[self.panel viewWithTag:103];
+    if ([note isKindOfClass:[UILabel class]])
+        note.hidden = !(sw.on && HookManager_IsReady() && !Aim_WallCheckAvailable());
 }
 
 - (void)fovChanged:(UISlider*)sl {
@@ -431,14 +528,27 @@ std::string Player_GetNickname(Il2CppObject* player);
         : @"Min Range: off";
 }
 
-// ---- Botão flutuante de AimLock (fora do menu) ----
+// ---- Botão flutuante de lock (fora do menu) ----
+// Toque: trava a mira no jogador que está dentro do círculo de FOV; toque de novo
+// solta. Sem ninguém no círculo, mostra "∅" por um instante e não trava.
 - (void)toggleLockButton {
-    g_cheat.aimLock = !g_cheat.aimLock;
+    if (g_cheat.aimLock) {
+        Aim_LockRelease();
+    } else if (!Aim_LockAcquire()) {
+        [self.lockBtn setTitle:@"∅" forState:UIControlStateNormal];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [self refreshLockButtonAppearance]; });
+        return;
+    }
+    [self syncAimLockSwitch];
     [self refreshLockButtonAppearance];
-    // Mantém o switch "AimLock" dentro do painel em sincronia, se o painel
-    // já foi montado (buildMenuItems roda antes do primeiro uso do botão).
+}
+
+// Mantém o switch "AimLock" do painel igual a g_cheat.aimLock.
+- (void)syncAimLockSwitch {
     UISwitch* sw = (UISwitch*)[self.panel viewWithTag:101];
-    if ([sw isKindOfClass:[UISwitch class]]) [sw setOn:g_cheat.aimLock animated:YES];
+    if ([sw isKindOfClass:[UISwitch class]] && sw.on != g_cheat.aimLock)
+        [sw setOn:g_cheat.aimLock animated:YES];
 }
 
 - (void)refreshLockButtonAppearance {
@@ -446,6 +556,8 @@ std::string Player_GetNickname(Il2CppObject* player);
     UIColor* active   = [UIColor colorWithRed:0.2 green:1.0 blue:0.3 alpha:1];
     UIColor* inactive = [UIColor colorWithRed:1   green:0.3 blue:0.3 alpha:1];
     self.lockBtn.layer.borderColor = (g_cheat.aimLock ? active : inactive).CGColor;
+    [self.lockBtn setTitle:(g_cheat.aimLock ? @"🔒" : @"🎯") forState:UIControlStateNormal];
+    self.lockShownOn = g_cheat.aimLock;
 }
 
 // ---- Drag do botão ----
@@ -459,8 +571,17 @@ std::string Player_GetNickname(Il2CppObject* player);
 
 // ---- Refresh ESP ----
 - (void)refreshESP {
-    if (g_cheat.esp && HookManager_IsReady()) {
-        [self.espView setNeedsDisplay];
+    // Redesenha enquanto há algo a mostrar (ESP ou círculo de FOV) e UMA vez a mais
+    // ao desligar, para apagar o último quadro (senão ele ficava congelado na tela).
+    BOOL fovVisible = g_cheat.showFov && (g_cheat.aimbot || g_cheat.aimLock || g_cheat.lockButton);
+    BOOL want = (g_cheat.esp && HookManager_IsReady()) || fovVisible;
+    if (want || self.wasDrawing) [self.espView setNeedsDisplay];
+    self.wasDrawing = want;
+
+    // O lock pode soltar sozinho (alvo saiu da partida): reflete no botão e no switch.
+    if (self.lockShownOn != g_cheat.aimLock) {
+        [self syncAimLockSwitch];
+        [self refreshLockButtonAppearance];
     }
 }
 
