@@ -71,6 +71,19 @@ typedef Il2CppObject*   (*t_il2cpp_runtime_invoke)(MethodInfo*, void*, void**, v
 typedef uint8_t*        (*t_il2cpp_array_addr_with_size)(Il2CppArray*, int32_t, uintptr_t);
 typedef uintptr_t       (*t_il2cpp_array_length)(Il2CppArray*);
 
+// Introspecção (opcional): escolher overload por assinatura e listar campos.
+// Se algum símbolo faltar, só os recursos que dependem dele ficam indisponíveis.
+typedef MethodInfo*       (*t_il2cpp_class_get_methods)(Il2CppClass*, void** iter);
+typedef const char*       (*t_il2cpp_method_get_name)(MethodInfo*);
+typedef uint32_t          (*t_il2cpp_method_get_param_count)(MethodInfo*);
+typedef const Il2CppType* (*t_il2cpp_method_get_param)(MethodInfo*, uint32_t index);
+typedef char*             (*t_il2cpp_type_get_name)(const Il2CppType*);
+typedef Il2CppField*      (*t_il2cpp_class_get_fields)(Il2CppClass*, void** iter);
+typedef const char*       (*t_il2cpp_field_get_name)(Il2CppField*);
+typedef size_t            (*t_il2cpp_field_get_offset)(Il2CppField*);
+typedef const Il2CppType* (*t_il2cpp_field_get_type)(Il2CppField*);
+typedef Il2CppClass*      (*t_il2cpp_class_get_parent)(Il2CppClass*);
+
 // String helpers
 typedef Il2CppString*   (*t_il2cpp_string_new)(const char*);
 typedef char*           (*t_il2cpp_string_chars)(Il2CppString*);
@@ -99,6 +112,16 @@ struct Il2CppAPI {
     t_il2cpp_array_length                  array_length;
     t_il2cpp_string_new                    string_new;
     t_resolve_icall                        resolve_icall;
+    t_il2cpp_class_get_methods             class_get_methods;
+    t_il2cpp_method_get_name               method_get_name;
+    t_il2cpp_method_get_param_count        method_get_param_count;
+    t_il2cpp_method_get_param              method_get_param;
+    t_il2cpp_type_get_name                 type_get_name;
+    t_il2cpp_class_get_fields              class_get_fields;
+    t_il2cpp_field_get_name                field_get_name;
+    t_il2cpp_field_get_offset              field_get_offset;
+    t_il2cpp_field_get_type                field_get_type;
+    t_il2cpp_class_get_parent              class_get_parent;
     bool                                   ready;
 };
 
