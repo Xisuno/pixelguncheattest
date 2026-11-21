@@ -83,6 +83,9 @@ typedef const char*       (*t_il2cpp_field_get_name)(Il2CppField*);
 typedef size_t            (*t_il2cpp_field_get_offset)(Il2CppField*);
 typedef const Il2CppType* (*t_il2cpp_field_get_type)(Il2CppField*);
 typedef Il2CppClass*      (*t_il2cpp_class_get_parent)(Il2CppClass*);
+typedef int               (*t_il2cpp_field_get_flags)(Il2CppField*);
+typedef Il2CppClass*      (*t_il2cpp_class_from_type)(const Il2CppType*);
+typedef bool              (*t_il2cpp_class_is_valuetype)(Il2CppClass*);
 
 // String helpers
 typedef Il2CppString*   (*t_il2cpp_string_new)(const char*);
@@ -122,6 +125,9 @@ struct Il2CppAPI {
     t_il2cpp_field_get_offset              field_get_offset;
     t_il2cpp_field_get_type                field_get_type;
     t_il2cpp_class_get_parent              class_get_parent;
+    t_il2cpp_field_get_flags               field_get_flags;
+    t_il2cpp_class_from_type               class_from_type;
+    t_il2cpp_class_is_valuetype            class_is_valuetype;
     bool                                   ready;
 };
 
@@ -135,14 +141,32 @@ template<typename T>
 inline T& Field(Il2CppObject* obj, ptrdiff_t offset) {
     return *reinterpret_cast<T*>(reinterpret_cast<uint8_t*>(obj) + offset);
 }
-// Lê string IL2CPP como std::string utf8 simples (ASCII safe)
+// Lê string IL2CPP (UTF-16) como std::string em UTF-8 (com pares substitutos).
 inline std::string Il2CppStringToStd(Il2CppString* s) {
-    if (!s || s->length <= 0) return "";
+    if (!s || s->length <= 0 || s->length > 4096) return "";
     std::string out;
-    out.reserve(s->length);
+    out.reserve((size_t)s->length * 2);
     for (int i = 0; i < s->length; i++) {
-        uint16_t c = s->chars[i];
-        out += (c < 128) ? (char)c : '?';
+        uint32_t c = s->chars[i];
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s->length) {
+            uint32_t lo = s->chars[i + 1];
+            if (lo >= 0xDC00 && lo <= 0xDFFF) { c = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00); i++; }
+        }
+        if (c < 0x80) {
+            out += (char)c;
+        } else if (c < 0x800) {
+            out += (char)(0xC0 | (c >> 6));
+            out += (char)(0x80 | (c & 0x3F));
+        } else if (c < 0x10000) {
+            out += (char)(0xE0 | (c >> 12));
+            out += (char)(0x80 | ((c >> 6) & 0x3F));
+            out += (char)(0x80 | (c & 0x3F));
+        } else {
+            out += (char)(0xF0 | (c >> 18));
+            out += (char)(0x80 | ((c >> 12) & 0x3F));
+            out += (char)(0x80 | ((c >> 6) & 0x3F));
+            out += (char)(0x80 | (c & 0x3F));
+        }
     }
     return out;
 }

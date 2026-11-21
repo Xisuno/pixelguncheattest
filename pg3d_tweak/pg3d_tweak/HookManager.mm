@@ -899,6 +899,84 @@ std::string Player_GetNickname(Il2CppObject* player); // definida mais abaixo (l
 static bool s_teamDumpRequested = false;
 extern "C" void Diag_RequestTeamDump(void) { s_teamDumpRequested = true; }
 
+static bool IsIntLike(const char* tn) {
+    return !strcmp(tn, "System.Boolean") || !strcmp(tn, "System.Byte") || !strcmp(tn, "System.SByte") ||
+           !strcmp(tn, "System.Int16") || !strcmp(tn, "System.UInt16") ||
+           !strcmp(tn, "System.Int32") || !strcmp(tn, "System.UInt32");
+}
+
+// Campo estático: o "offset" dele não é de instância (ler em obj+offset daria lixo).
+static bool FieldIsStatic(Il2CppField* fl) {
+    return g_il2cpp.field_get_flags && (g_il2cpp.field_get_flags(fl) & 0x10) != 0; // FIELD_ATTRIBUTE_STATIC
+}
+
+// Campo de referência para uma classe do jogo (não valuetype, não System/UnityEngine,
+// não array/genérico): seguro de seguir um nível para dentro quando o objeto é vivo.
+static bool IsGameRefType(const Il2CppType* ty, const char* tn) {
+    if (!g_il2cpp.class_from_type || !g_il2cpp.class_is_valuetype || !g_il2cpp.field_get_flags) return false;
+    if (!strncmp(tn, "System.", 7) || !strncmp(tn, "UnityEngine.", 12)) return false;
+    if (strpbrk(tn, "[`&*<")) return false;
+    Il2CppClass* tc = g_il2cpp.class_from_type(ty);
+    return tc && !g_il2cpp.class_is_valuetype(tc);
+}
+
+// Compara os campos escalares (bool/byte/short/int) de objs[0..n-1] (0 = local) e loga
+// só os que DIFEREM entre os jogadores (ou têm nome de time). Os nomes do jogo são
+// ofuscados, então o sinal de time se acha pela diferença entre aliados e inimigos.
+// Um nível de profundidade: segue referências para classes do jogo.
+static void DumpFieldsDiff(const std::string& prefix, Il2CppClass* cls, Il2CppObject** objs, int n,
+                           int& logged, int depth, FILE* f) {
+    static const char* const kKeys[] = { "team", "command", "ally", "enemy", "friend", "clan",
+                                         "bot", "dead", "alive", "mine", "color" };
+    for (Il2CppClass* k = cls; k; ) {
+        void* it = nullptr;
+        while (Il2CppField* fl = g_il2cpp.class_get_fields(k, &it)) {
+            const char* name = g_il2cpp.field_get_name(fl);
+            size_t off = g_il2cpp.field_get_offset(fl);
+            const Il2CppType* ty = g_il2cpp.field_get_type(fl);
+            char* tn = ty ? g_il2cpp.type_get_name(ty) : nullptr;
+            if (!name || !tn) continue;
+            if (off < 0x10 || FieldIsStatic(fl)) continue;
+            if (f && depth == 0) fprintf(f, "0x%zx\t%s\t%s\n", off, tn, name);
+
+            char vals[8][32];
+            if (IsIntLike(tn) || (strcmp(tn, "System.Single") == 0 && depth == 0)) {
+                bool key = false;
+                for (const char* kw : kKeys) if (strcasestr(name, kw)) { key = true; break; }
+                if (!IsIntLike(tn) && !key) continue; // floats só se o nome parecer de time
+                bool ok = true, differs = false;
+                for (int i = 0; i < n && ok; i++) {
+                    ok = FmtScalar(objs[i], off, tn, vals[i], sizeof(vals[i]));
+                    if (ok && i > 0 && strcmp(vals[i], vals[0]) != 0) differs = true;
+                }
+                if (!ok || (!differs && !key) || logged >= 600) continue;
+                std::string joined;
+                for (int i = 0; i < n; i++) { if (i) joined += ","; joined += vals[i]; }
+                PG3D_Log("[pg3d_tweak] TEAMDUMP: %s%s (%s @0x%zx) [%s]", prefix.c_str(), name, tn, off, joined.c_str());
+                logged++;
+            } else if (depth == 0 && IsGameRefType(ty, tn)) {
+                Il2CppObject* refs[8];
+                bool ok = g_il2cpp.object_get_class != nullptr;
+                Il2CppClass* rk = nullptr;
+                for (int i = 0; i < n && ok; i++) {
+                    refs[i] = Field<Il2CppObject*>(objs[i], (ptrdiff_t)off);
+                    if (!refs[i]) { ok = false; break; }
+                    Il2CppClass* ck = g_il2cpp.object_get_class(refs[i]);
+                    if (!ck || (rk && ck != rk)) { ok = false; break; }
+                    rk = ck;
+                }
+                if (ok && rk) {
+                    // Se for o MESMO objeto para todos, não distingue ninguém: pula.
+                    bool same = true;
+                    for (int i = 1; i < n; i++) if (refs[i] != refs[0]) same = false;
+                    if (!same) DumpFieldsDiff(std::string(name) + "->", rk, refs, n, logged, 1, nullptr);
+                }
+            }
+        }
+        k = g_il2cpp.class_get_parent ? g_il2cpp.class_get_parent(k) : nullptr;
+    }
+}
+
 static void DumpTeamCandidatesOnce() {
     static bool done = false;
     static double firstSeen = 0.0;
@@ -917,12 +995,13 @@ static void DumpTeamCandidatesOnce() {
     done = true;
     s_teamDumpRequested = false;
 
-    // Quem é quem: apelido + estado dos outlines que o jogo usa para aliado/inimigo.
+    // Quem é quem: apelido (UTF-8) + estado dos outlines que o jogo usa para aliado/inimigo.
+    PG3D_Log("[pg3d_tweak] TEAMDUMP: ordem dos valores = [local, outro0, outro1, ...]");
     PG3D_Log("[pg3d_tweak] TEAMDUMP: local=%p nick=%s", (void*)s_localPlayer,
              Player_GetNickname(s_localPlayer).c_str());
     for (size_t i = 0; i < others.size(); i++) {
         Il2CppObject* p = others[i];
-        PG3D_Log("[pg3d_tweak] TEAMDUMP: outro[%zu]=%p nick=%s outline_aliado=%d outline_inimigo=%d", i, (void*)p,
+        PG3D_Log("[pg3d_tweak] TEAMDUMP: outro%zu=%p nick=%s outline_aliado=%d outline_inimigo=%d", i, (void*)p,
                  Player_GetNickname(p).c_str(),
                  (int)GetBehaviourEnabled(Field<Il2CppObject*>(p, PlayerMove::allyOutline)),
                  (int)GetBehaviourEnabled(Field<Il2CppObject*>(p, PlayerMove::enemyOutline)));
@@ -937,35 +1016,17 @@ static void DumpTeamCandidatesOnce() {
     const char* tmp = NSTemporaryDirectory().fileSystemRepresentation;
     snprintf(path, sizeof(path), "%s/pg3d_fields.txt", tmp ? tmp : "/tmp");
     FILE* f = fopen(path, "w");
-    PG3D_Log("[pg3d_tweak] TEAMDUMP: lista completa de campos em %s (local=%p, outros=%zu)",
-             path, (void*)s_localPlayer, others.size());
+    PG3D_Log("[pg3d_tweak] TEAMDUMP: lista completa de campos em %s (local=%p, outros=%zu, profundidade=%s)",
+             path, (void*)s_localPlayer, others.size(),
+             (g_il2cpp.class_from_type && g_il2cpp.class_is_valuetype && g_il2cpp.field_get_flags) ? "1" : "0 (APIs de tipo ausentes)");
 
-    static const char* const kKeys[] = { "team", "command", "ally", "enemy", "friend", "clan",
-                                         "bot", "dead", "alive", "mine", "color" };
+    Il2CppObject* objs[8];
+    int n = 0;
+    objs[n++] = s_localPlayer;
+    for (Il2CppObject* p : others) objs[n++] = p;
     int logged = 0;
-    for (Il2CppClass* k = cls_PlayerMove; k; ) {
-        void* it = nullptr;
-        while (Il2CppField* fl = g_il2cpp.class_get_fields(k, &it)) {
-            const char* name = g_il2cpp.field_get_name(fl);
-            size_t off = g_il2cpp.field_get_offset(fl);
-            const Il2CppType* ty = g_il2cpp.field_get_type(fl);
-            char* tn = ty ? g_il2cpp.type_get_name(ty) : nullptr;
-            if (!name || !tn) continue;
-            if (f) fprintf(f, "0x%zx\t%s\t%s\n", off, tn, name);
-
-            bool match = false;
-            for (const char* key : kKeys) if (strcasestr(name, key)) { match = true; break; }
-            if (!match || logged >= 60) continue;
-            char lv[32];
-            if (!FmtScalar(s_localPlayer, off, tn, lv, sizeof(lv))) continue;
-            char ov[5][32] = {"-", "-", "-", "-", "-"};
-            for (size_t i = 0; i < others.size(); i++) FmtScalar(others[i], off, tn, ov[i], sizeof(ov[i]));
-            PG3D_Log("[pg3d_tweak] TEAMDUMP: %s %s @0x%zx local=%s outros=[%s,%s,%s,%s,%s]",
-                     tn, name, off, lv, ov[0], ov[1], ov[2], ov[3], ov[4]);
-            logged++;
-        }
-        k = g_il2cpp.class_get_parent ? g_il2cpp.class_get_parent(k) : nullptr;
-    }
+    DumpFieldsDiff("", cls_PlayerMove, objs, n, logged, 0, f);
+    PG3D_Log("[pg3d_tweak] TEAMDUMP: fim (%d campos que diferem entre jogadores)", logged);
     if (f) fclose(f);
 }
 
@@ -1164,6 +1225,12 @@ static void* InitThread(void*) {
     g_il2cpp.field_get_offset       = (t_il2cpp_field_get_offset)       dlsym(RTLD_DEFAULT, "il2cpp_field_get_offset");
     g_il2cpp.field_get_type         = (t_il2cpp_field_get_type)         dlsym(RTLD_DEFAULT, "il2cpp_field_get_type");
     g_il2cpp.class_get_parent       = (t_il2cpp_class_get_parent)       dlsym(RTLD_DEFAULT, "il2cpp_class_get_parent");
+    g_il2cpp.field_get_flags        = (t_il2cpp_field_get_flags)        dlsym(RTLD_DEFAULT, "il2cpp_field_get_flags");
+    g_il2cpp.class_from_type        = (t_il2cpp_class_from_type)        dlsym(RTLD_DEFAULT, "il2cpp_class_from_type");
+    g_il2cpp.class_is_valuetype     = (t_il2cpp_class_is_valuetype)     dlsym(RTLD_DEFAULT, "il2cpp_class_is_valuetype");
+    PG3D_Log("[pg3d_tweak] INTROSPECCAO: field_get_flags=%p class_from_type=%p class_is_valuetype=%p",
+             (void*)g_il2cpp.field_get_flags, (void*)g_il2cpp.class_from_type,
+             (void*)g_il2cpp.class_is_valuetype);
     PG3D_Log("[pg3d_tweak] INTROSPECCAO: class_get_methods=%p method_get_param=%p type_get_name=%p class_get_fields=%p field_get_offset=%p class_get_parent=%p",
              (void*)g_il2cpp.class_get_methods, (void*)g_il2cpp.method_get_param,
              (void*)g_il2cpp.type_get_name, (void*)g_il2cpp.class_get_fields,
