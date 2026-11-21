@@ -894,22 +894,39 @@ static bool FmtScalar(Il2CppObject* o, size_t off, const char* tn, char* out, si
     return false;
 }
 
+std::string Player_GetNickname(Il2CppObject* player); // definida mais abaixo (linkage C++)
+
+static bool s_teamDumpRequested = false;
+extern "C" void Diag_RequestTeamDump(void) { s_teamDumpRequested = true; }
+
 static void DumpTeamCandidatesOnce() {
     static bool done = false;
     static double firstSeen = 0.0;
     static int tick = 0;
-    if (done) return;
-    if (tick++ % 60 != 0) return;
+    if (done && !s_teamDumpRequested) return;
+    if (tick++ % 60 != 0 && !s_teamDumpRequested) return;
     double now = NowSec();
     if (firstSeen == 0.0) firstSeen = now;
-    if (now - firstSeen < 8.0) return; // espera a partida estabilizar
+    if (now - firstSeen < 8.0 && !s_teamDumpRequested) return; // espera a partida estabilizar
 
     std::vector<Il2CppObject*> live, others;
     LivePlayers(live);
     for (Il2CppObject* p : live)
-        if (p != s_localPlayer && others.size() < 3) others.push_back(p);
+        if (p != s_localPlayer && others.size() < 5) others.push_back(p);
     if (others.empty()) return; // tenta de novo quando aparecer alguém
     done = true;
+    s_teamDumpRequested = false;
+
+    // Quem é quem: apelido + estado dos outlines que o jogo usa para aliado/inimigo.
+    PG3D_Log("[pg3d_tweak] TEAMDUMP: local=%p nick=%s", (void*)s_localPlayer,
+             Player_GetNickname(s_localPlayer).c_str());
+    for (size_t i = 0; i < others.size(); i++) {
+        Il2CppObject* p = others[i];
+        PG3D_Log("[pg3d_tweak] TEAMDUMP: outro[%zu]=%p nick=%s outline_aliado=%d outline_inimigo=%d", i, (void*)p,
+                 Player_GetNickname(p).c_str(),
+                 (int)GetBehaviourEnabled(Field<Il2CppObject*>(p, PlayerMove::allyOutline)),
+                 (int)GetBehaviourEnabled(Field<Il2CppObject*>(p, PlayerMove::enemyOutline)));
+    }
 
     if (!g_il2cpp.class_get_fields || !g_il2cpp.field_get_name || !g_il2cpp.field_get_offset ||
         !g_il2cpp.field_get_type || !g_il2cpp.type_get_name) {
@@ -941,10 +958,10 @@ static void DumpTeamCandidatesOnce() {
             if (!match || logged >= 60) continue;
             char lv[32];
             if (!FmtScalar(s_localPlayer, off, tn, lv, sizeof(lv))) continue;
-            char ov[3][32] = {"-", "-", "-"};
+            char ov[5][32] = {"-", "-", "-", "-", "-"};
             for (size_t i = 0; i < others.size(); i++) FmtScalar(others[i], off, tn, ov[i], sizeof(ov[i]));
-            PG3D_Log("[pg3d_tweak] TEAMDUMP: %s %s @0x%zx local=%s outros=[%s,%s,%s]",
-                     tn, name, off, lv, ov[0], ov[1], ov[2]);
+            PG3D_Log("[pg3d_tweak] TEAMDUMP: %s %s @0x%zx local=%s outros=[%s,%s,%s,%s,%s]",
+                     tn, name, off, lv, ov[0], ov[1], ov[2], ov[3], ov[4]);
             logged++;
         }
         k = g_il2cpp.class_get_parent ? g_il2cpp.class_get_parent(k) : nullptr;

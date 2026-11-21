@@ -59,6 +59,9 @@ bool  Aim_LockAcquire(void);
 void  Aim_LockRelease(void);
 // true se Physics.Linecast(Vector3, Vector3) foi resolvido neste build.
 bool  Aim_WallCheckAvailable(void);
+// Pede ao HookManager que grave agora (no log e em pg3d_fields.txt) os campos de
+// Player_move_c e o valor dos que parecem de time, para o local e até 5 outros.
+void  Diag_RequestTeamDump(void);
 
 #ifdef __cplusplus
 } // extern "C"

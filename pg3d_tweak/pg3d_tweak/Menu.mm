@@ -407,6 +407,17 @@ std::string Player_GetNickname(Il2CppObject* player);
     y += 14;
     makeToggle(@"AC Bypass",  g_cheat.acBypass,   @selector(toggleAC:),        0);
 
+    // Coleta de dados para o Team Check (grava no log; não altera o jogo)
+    UIButton* dumpBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    dumpBtn.frame = CGRectMake(10, y, pw - 20, 26);
+    [dumpBtn setTitle:@"Dump de times (log)" forState:UIControlStateNormal];
+    dumpBtn.titleLabel.font = [UIFont systemFontOfSize:11];
+    dumpBtn.tintColor = [UIColor colorWithRed:1 green:0.7 blue:0.4 alpha:1];
+    [dumpBtn addTarget:self action:@selector(dumpTeams)
+      forControlEvents:UIControlEventTouchUpInside];
+    [sv addSubview:dumpBtn];
+    y += 30;
+
     // FOV slider
     UILabel* fovLbl = [[UILabel alloc] initWithFrame:CGRectMake(10, y, pw-20, 18)];
     fovLbl.textColor = [UIColor lightGrayColor];
@@ -490,6 +501,8 @@ std::string Player_GetNickname(Il2CppObject* player);
 }
 
 - (void)toggleShowFov:(UISwitch*)sw { g_cheat.showFov = sw.on; }
+
+- (void)dumpTeams { Diag_RequestTeamDump(); }
 
 // Mira gira o corpo (yaw) + câmera (pitch). Desligue para comparar com o modo antigo
 // (só o container da câmera) se o joystick se comportar diferente.
