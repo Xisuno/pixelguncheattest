@@ -383,6 +383,7 @@ std::string Player_GetNickname(Il2CppObject* player);
     makeToggle(@"Aimbot",     g_cheat.aimbot,     @selector(toggleAimbot:),    0);
     makeToggle(@"AimLock",    g_cheat.aimLock,    @selector(toggleAimLock:),   101);
     makeToggle(@"Botão Lock", g_cheat.lockButton, @selector(toggleLockBtn:),   0);
+    makeToggle(@"Aim gira o corpo", g_cheat.aimBodyYaw, @selector(toggleAimBody:), 0);
     makeToggle(@"Mostrar FOV", g_cheat.showFov,   @selector(toggleShowFov:),   0);
 
     makeSection(@"PARTE DO CORPO (multi-seleção)");
@@ -489,6 +490,10 @@ std::string Player_GetNickname(Il2CppObject* player);
 }
 
 - (void)toggleShowFov:(UISwitch*)sw { g_cheat.showFov = sw.on; }
+
+// Mira gira o corpo (yaw) + câmera (pitch). Desligue para comparar com o modo antigo
+// (só o container da câmera) se o joystick se comportar diferente.
+- (void)toggleAimBody:(UISwitch*)sw { g_cheat.aimBodyYaw = sw.on; }
 
 // Mostra/esconde o botão flutuante de lock (fora do menu).
 - (void)toggleLockBtn:(UISwitch*)sw {

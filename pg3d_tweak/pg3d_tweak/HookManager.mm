@@ -38,7 +38,7 @@ Il2CppAPI    g_il2cpp      = {};
 // wallCheck, minRange, initialized.
 // ... initialized, aimParts (só cabeça), showFov, lockButton.
 CheatState   g_cheat       = { false, false, 15.0f, false, false, true, false, false, 0.0f, false,
-                               AIM_PART_HEAD, true, false };
+                               AIM_PART_HEAD, true, false, true };
 
 // ============================================================
 //  Log de diagnóstico (NSLog + arquivo)
@@ -109,6 +109,8 @@ static MethodInfo*  s_mRaycast        = nullptr; // só diagnóstico (overload p
 static MethodInfo*  s_mLinecast       = nullptr;
 static MethodInfo*  s_mGetTransform   = nullptr; // Component.get_transform (para a posição da câmera)
 static MethodInfo*  s_mSetRot         = nullptr; // Transform.set_rotation(Quaternion)
+static MethodInfo*  s_mGetRot         = nullptr; // Transform.get_rotation()
+static MethodInfo*  s_mIsChildOf      = nullptr; // Transform.IsChildOf(Transform)
 
 // Icalls Unity que usamos para Transform.position e Camera.WorldToScreenPoint
 typedef void (*fn_Transform_GetPos)(void* tr, Vector3* out);
@@ -224,6 +226,8 @@ static void ResolveManagedHelpers() {
     s_mPixW    = g_il2cpp.class_get_method_from_name(cls_Camera,    "get_pixelWidth", 0);
     s_mPixH    = g_il2cpp.class_get_method_from_name(cls_Camera,    "get_pixelHeight", 0);
     s_mSetRot = g_il2cpp.class_get_method_from_name(cls_Transform, "set_rotation", 1);
+    s_mGetRot = g_il2cpp.class_get_method_from_name(cls_Transform, "get_rotation", 0);
+    s_mIsChildOf = g_il2cpp.class_get_method_from_name(cls_Transform, "IsChildOf", 1);
     // get_transform é declarado em Component (ancestral de Camera): sobe a hierarquia.
     for (Il2CppClass* k = cls_Camera; k && !s_mGetTransform; ) {
         s_mGetTransform = g_il2cpp.class_get_method_from_name(k, "get_transform", 0);
@@ -232,6 +236,8 @@ static void ResolveManagedHelpers() {
     PG3D_Log("[pg3d_tweak] MANAGED: Camera.get_main=%p WorldToScreenPoint(1)=%p Transform.get_position=%p get_pixelWidth=%p get_pixelHeight=%p set_rotation=%p get_transform=%p",
              (void*)s_mGetMain, (void*)s_mW2S, (void*)s_mGetPos, (void*)s_mPixW, (void*)s_mPixH,
              (void*)s_mSetRot, (void*)s_mGetTransform);
+    PG3D_Log("[pg3d_tweak] MANAGED: Transform.get_rotation=%p Transform.IsChildOf=%p",
+             (void*)s_mGetRot, (void*)s_mIsChildOf);
 }
 
 static float CamPixel(Il2CppObject* cam, MethodInfo* m) {
@@ -729,6 +735,51 @@ static MethodInfo* meth_Transform_LookAt = nullptr;
 // Valor não calibrado (primeiro lugar para apertar/afrouxar se ainda inverter).
 static constexpr float kMaxAimPitchDeg = 75.0f;
 
+static bool GetTransformRotation(Il2CppObject* tr, Quaternion& out) {
+    ResolveManagedHelpers();
+    if (!tr || !s_mGetRot || !g_il2cpp.runtime_invoke) return false;
+    void* ex = nullptr;
+    Il2CppObject* ret = g_il2cpp.runtime_invoke(s_mGetRot, tr, nullptr, &ex);
+    if (!ret || ex) return false;
+    out = Field<Quaternion>(ret, 0x10);
+    return std::isfinite(out.x) && std::isfinite(out.w);
+}
+
+// child está na hierarquia de parent? (cacheado: só reavalia se os objetos mudarem)
+static bool IsDescendantOf(Il2CppObject* child, Il2CppObject* parent) {
+    static Il2CppObject* cachedChild = nullptr;
+    static Il2CppObject* cachedParent = nullptr;
+    static bool cachedResult = false;
+    if (child == cachedChild && parent == cachedParent) return cachedResult;
+    cachedChild = child;
+    cachedParent = parent;
+    cachedResult = false;
+    if (s_mIsChildOf && g_il2cpp.runtime_invoke) {
+        void* args[1] = { parent };
+        void* ex = nullptr;
+        Il2CppObject* ret = g_il2cpp.runtime_invoke(s_mIsChildOf, child, args, &ex);
+        cachedResult = ret && !ex && Field<bool>(ret, 0x10);
+    }
+    PG3D_Log("[pg3d_tweak] AIMBODY: myCameraContainer=%p IsChildOf(myPlayerTransform=%p) = %d (IsChildOf=%p)",
+             (void*)child, (void*)parent, (int)cachedResult, (void*)s_mIsChildOf);
+    return cachedResult;
+}
+
+// Diagnóstico do joystick invertido: yaw do corpo vs yaw do container da câmera.
+// Se, com a mira desligada, a diferença ficar ≠ 0 depois de usar a mira, a mira
+// deixou o container "torto" em relação ao corpo.
+static void LogYaw() {
+    if (!s_localPlayer) return;
+    Il2CppObject* bodyTr = Field<Il2CppObject*>(s_localPlayer, PlayerMove::myPlayerTransform);
+    Il2CppObject* cont   = Field<Il2CppObject*>(s_localPlayer, 0x478);
+    Quaternion qb, qc;
+    if (!GetTransformRotation(bodyTr, qb) || !GetTransformRotation(cont, qc)) return;
+    float yb = AM_QuatYawDeg(qb), yc = AM_QuatYawDeg(qc);
+    PG3D_Log("[pg3d_tweak] YAW: corpo=%.1f container=%.1f dif=%.1f | aimbot=%d aimLock=%d corpoYaw=%d",
+             yb, yc, AM_WrapDeg(yc - yb), (int)g_cheat.aimbot, (int)g_cheat.aimLock,
+             (int)g_cheat.aimBodyYaw);
+}
+
 static void AimAtPoint(Il2CppObject* localPlayer, Il2CppObject* targetPlayer, const AimPoint& pt) {
     if (!localPlayer || !targetPlayer) return;
     // 0x478 = myCameraContainer (confirmado contra o dump.cs, ver offsets.h).
@@ -738,6 +789,7 @@ static void AimAtPoint(Il2CppObject* localPlayer, Il2CppObject* targetPlayer, co
     Vector3 origin = GetTransformPosition(camContainer);
     Vector3 d = AM_Sub(pt.world, origin);
     float horiz = std::sqrt(d.x * d.x + d.z * d.z);
+    bool bodyYawed = false;
     float pitchDeg = std::atan2(d.y, horiz) * (180.0f / (float)M_PI);
     if (std::fabs(pitchDeg) > kMaxAimPitchDeg) {
         static int s_skipLogCnt = 0;
@@ -746,6 +798,28 @@ static void AimAtPoint(Il2CppObject* localPlayer, Il2CppObject* targetPlayer, co
                      "para evitar inversao de joystick", pitchDeg, kMaxAimPitchDeg);
         }
         return;
+    }
+
+    // Joystick invertido: o jogo move o personagem relativo ao CORPO (hipótese a
+    // confirmar com as linhas YAW/AIMBODY do log), mas só girávamos o container da
+    // câmera (inclusive o yaw), deixando view e corpo em direções diferentes. Aqui o
+    // yaw vai para o corpo (myPlayerTransform) e o container só completa o pitch.
+    // Só vale se o container for filho do corpo; senão cai no comportamento antigo.
+    Il2CppObject* bodyTr = Field<Il2CppObject*>(localPlayer, PlayerMove::myPlayerTransform);
+    if (g_cheat.aimBodyYaw && bodyTr && s_mSetRot && horiz > 1e-3f &&
+        IsDescendantOf(camContainer, bodyTr)) {
+        Quaternion qy;
+        if (AM_LookRotation(Vector3{d.x, 0.0f, d.z}, Vector3{0, 1, 0}, qy)) {
+            void* yargs[1] = { &qy };
+            void* yex = nullptr;
+            g_il2cpp.runtime_invoke(s_mSetRot, bodyTr, yargs, &yex);
+            bodyYawed = (yex == nullptr);
+            if (bodyYawed) {
+                // o container mudou de posição junto com o corpo: recalcula a direção
+                origin = GetTransformPosition(camContainer);
+                d = AM_Sub(pt.world, origin);
+            }
+        }
     }
 
     Il2CppObject* headTr = Field<Il2CppObject*>(targetPlayer, PlayerMove::headTransform);
@@ -771,8 +845,8 @@ static void AimAtPoint(Il2CppObject* localPlayer, Il2CppObject* targetPlayer, co
 
     static int s_aimLogCnt = 0;
     if (s_aimLogCnt++ % 300 == 0) {
-        PG3D_Log("[pg3d_tweak] AIMAT: local=%p camContainer=%p alvo=%p via %s", (void*)localPlayer,
-                 (void*)camContainer, (void*)targetPlayer, path);
+        PG3D_Log("[pg3d_tweak] AIMAT: local=%p camContainer=%p alvo=%p via %s corpoYaw=%d", (void*)localPlayer,
+                 (void*)camContainer, (void*)targetPlayer, path, (int)bodyYawed);
     }
     if (ex) {
         static bool s_exLogged = false;
@@ -909,6 +983,8 @@ static void hook_PlayerUpdate(Il2CppObject* self, void* /*unused*/) {
 
     static int calibCnt = 0;
     if (calibCnt++ % 600 == 0) LogCalib();
+    static int yawCnt = 0;
+    if (yawCnt++ % 300 == 0) LogYaw();
     DumpTeamCandidatesOnce();
 
     Il2CppObject* camera = GetMainCamera();

@@ -83,6 +83,7 @@ struct CheatState {
     unsigned char aimParts; // máscara AimPartBit; sempre >= 1 parte
     bool showFov;      // desenha o círculo de FOV no overlay
     bool lockButton;   // mostra o botão flutuante de lock (fora do menu)
+    bool aimBodyYaw;   // mira gira o CORPO (yaw) e a câmera (pitch), em vez de só o myCameraContainer
 };
 extern CheatState g_cheat;
 #endif

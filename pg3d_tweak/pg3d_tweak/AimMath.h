@@ -46,6 +46,19 @@ inline bool AM_LookRotation(Vector3 forward, Vector3 up, Quaternion& out) {
     return true;
 }
 
+// Yaw (graus, em torno de +Y) da direção "frente" (+Z) rotacionada por q.
+inline float AM_QuatYawDeg(Quaternion q) {
+    float fx = 2.0f * (q.x * q.z + q.w * q.y);
+    float fz = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
+    return std::atan2(fx, fz) * 180.0f / 3.14159265358979f;
+}
+// Normaliza uma diferença de ângulo para (-180, 180].
+inline float AM_WrapDeg(float a) {
+    while (a > 180.0f)   a -= 360.0f;
+    while (a <= -180.0f) a += 360.0f;
+    return a;
+}
+
 // Raio (em pontos) do círculo de FOV. Mesma regra que o aimbot usa para decidir
 // se um alvo está dentro do FOV: distância ao centro <= meia-diagonal * sin(fov/2).
 inline float AM_FovRadius(float halfW, float halfH, float fovDeg) {
