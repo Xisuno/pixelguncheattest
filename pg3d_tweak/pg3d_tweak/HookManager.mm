@@ -27,6 +27,7 @@
 #include "il2cpp_api.h"
 #include "offsets.h"
 #include "HookManager.h"
+#include "AimMath.h"
 
 // ============================================================
 //  Globals
@@ -35,7 +36,9 @@ Il2CppAPI    g_il2cpp      = {};
 // Ordem tem que bater exatamente com CheatState em HookManager.h:
 // aimbot, aimLock, aimbotFov, esp, espSkeleton, acBypass, teamCheck,
 // wallCheck, minRange, initialized.
-CheatState   g_cheat       = { false, false, 15.0f, false, false, true, false, false, 0.0f, false };
+// ... initialized, aimParts (só cabeça), showFov, lockButton.
+CheatState   g_cheat       = { false, false, 15.0f, false, false, true, false, false, 0.0f, false,
+                               AIM_PART_HEAD, true, false };
 
 // ============================================================
 //  Log de diagnóstico (NSLog + arquivo)
@@ -101,7 +104,11 @@ static MethodInfo*  s_mGetEnabled     = nullptr;
 // certa via il2cpp_method_get_param (tipo de cada parâmetro) em vez de
 // param_count.
 static Il2CppClass* cls_Physics       = nullptr;
-static MethodInfo*  s_mRaycast        = nullptr;
+static MethodInfo*  s_mRaycast        = nullptr; // só diagnóstico (overload por contagem de args NÃO é confiável)
+// Physics.Linecast(Vector3, Vector3): resolvido por assinatura exata (tipos dos parâmetros).
+static MethodInfo*  s_mLinecast       = nullptr;
+static MethodInfo*  s_mGetTransform   = nullptr; // Component.get_transform (para a posição da câmera)
+static MethodInfo*  s_mSetRot         = nullptr; // Transform.set_rotation(Quaternion)
 
 // Icalls Unity que usamos para Transform.position e Camera.WorldToScreenPoint
 typedef void (*fn_Transform_GetPos)(void* tr, Vector3* out);
@@ -156,6 +163,57 @@ static int           s_camFrameCnt  = 0;
 static float         s_pixW         = 0.0f; // tamanho do render target da câmera
 static float         s_pixH         = 0.0f;
 
+// ---- Escolha de overload por assinatura exata ----
+// Contar parâmetros NÃO distingue overloads (ex.: Physics.Raycast tem várias com 3
+// parâmetros; a escolhida por contagem reportava "bloqueado" para tudo). Aqui
+// comparamos o nome do tipo de cada parâmetro. type_get_name devolve memória
+// alocada pelo runtime; só é chamado na inicialização, então o vazamento é irrelevante.
+static MethodInfo* FindMethodBySig(Il2CppClass* cls, const char* name,
+                                   const char* const* params, int nparams) {
+    if (!cls || !g_il2cpp.class_get_methods || !g_il2cpp.method_get_name ||
+        !g_il2cpp.method_get_param_count || !g_il2cpp.method_get_param || !g_il2cpp.type_get_name)
+        return nullptr;
+    void* iter = nullptr;
+    while (MethodInfo* m = g_il2cpp.class_get_methods(cls, &iter)) {
+        const char* mn = g_il2cpp.method_get_name(m);
+        if (!mn || strcmp(mn, name) != 0) continue;
+        if ((int)g_il2cpp.method_get_param_count(m) != nparams) continue;
+        bool ok = true;
+        for (int i = 0; i < nparams && ok; i++) {
+            const Il2CppType* t = g_il2cpp.method_get_param(m, (uint32_t)i);
+            char* tn = t ? g_il2cpp.type_get_name(t) : nullptr;
+            ok = tn && strcmp(tn, params[i]) == 0;
+        }
+        if (ok) return m;
+    }
+    return nullptr;
+}
+
+// Loga a assinatura de cada overload de `name` (diagnóstico).
+static void LogOverloads(Il2CppClass* cls, const char* name) {
+    if (!cls || !g_il2cpp.class_get_methods || !g_il2cpp.method_get_name ||
+        !g_il2cpp.method_get_param_count || !g_il2cpp.method_get_param || !g_il2cpp.type_get_name) {
+        PG3D_Log("[pg3d_tweak] OVERLOAD %s: API de introspecção indisponível", name);
+        return;
+    }
+    void* iter = nullptr;
+    int n = 0;
+    while (MethodInfo* m = g_il2cpp.class_get_methods(cls, &iter)) {
+        const char* mn = g_il2cpp.method_get_name(m);
+        if (!mn || strcmp(mn, name) != 0) continue;
+        std::string sig;
+        uint32_t pc = g_il2cpp.method_get_param_count(m);
+        for (uint32_t i = 0; i < pc; i++) {
+            const Il2CppType* t = g_il2cpp.method_get_param(m, i);
+            char* tn = t ? g_il2cpp.type_get_name(t) : nullptr;
+            if (i) sig += ", ";
+            sig += tn ? tn : "?";
+        }
+        PG3D_Log("[pg3d_tweak] OVERLOAD %s(%s) = %p", name, sig.c_str(), (void*)m);
+        if (++n >= 16) break;
+    }
+}
+
 static void ResolveManagedHelpers() {
     static bool done = false;
     if (done || !g_il2cpp.class_get_method_from_name || !cls_Camera || !cls_Transform) return;
@@ -165,8 +223,15 @@ static void ResolveManagedHelpers() {
     s_mGetPos  = g_il2cpp.class_get_method_from_name(cls_Transform, "get_position", 0);
     s_mPixW    = g_il2cpp.class_get_method_from_name(cls_Camera,    "get_pixelWidth", 0);
     s_mPixH    = g_il2cpp.class_get_method_from_name(cls_Camera,    "get_pixelHeight", 0);
-    PG3D_Log("[pg3d_tweak] MANAGED: Camera.get_main=%p WorldToScreenPoint(1)=%p Transform.get_position=%p get_pixelWidth=%p get_pixelHeight=%p",
-             (void*)s_mGetMain, (void*)s_mW2S, (void*)s_mGetPos, (void*)s_mPixW, (void*)s_mPixH);
+    s_mSetRot = g_il2cpp.class_get_method_from_name(cls_Transform, "set_rotation", 1);
+    // get_transform é declarado em Component (ancestral de Camera): sobe a hierarquia.
+    for (Il2CppClass* k = cls_Camera; k && !s_mGetTransform; ) {
+        s_mGetTransform = g_il2cpp.class_get_method_from_name(k, "get_transform", 0);
+        k = g_il2cpp.class_get_parent ? g_il2cpp.class_get_parent(k) : nullptr;
+    }
+    PG3D_Log("[pg3d_tweak] MANAGED: Camera.get_main=%p WorldToScreenPoint(1)=%p Transform.get_position=%p get_pixelWidth=%p get_pixelHeight=%p set_rotation=%p get_transform=%p",
+             (void*)s_mGetMain, (void*)s_mW2S, (void*)s_mGetPos, (void*)s_mPixW, (void*)s_mPixH,
+             (void*)s_mSetRot, (void*)s_mGetTransform);
 }
 
 static float CamPixel(Il2CppObject* cam, MethodInfo* m) {
@@ -191,6 +256,17 @@ static Vector3 GetTransformPosition(Il2CppObject* transform) {
     return pos;
 }
 
+// Tamanho do overlay em pontos, informado pelo ESPView a cada layout (rotação
+// incluída). Antes do primeiro layout cai para UIScreen.
+static float s_ovW = 0.0f, s_ovH = 0.0f;
+extern "C" void Overlay_SetSize(float w, float h) { s_ovW = w; s_ovH = h; }
+static void OverlaySize(float& w, float& h) {
+    if (s_ovW > 1.0f && s_ovH > 1.0f) { w = s_ovW; h = s_ovH; return; }
+    CGRect b = [UIScreen mainScreen].bounds;
+    w = (float)b.size.width;
+    h = (float)b.size.height;
+}
+
 // Converte mundo -> coordenadas do overlay UIKit (pontos, origem no canto
 // superior esquerdo). O Unity devolve PIXELS do render target com origem no
 // canto INFERIOR esquerdo; por isso inverte Y e reescala para os pontos da tela.
@@ -206,9 +282,10 @@ static bool WorldToScreen(Il2CppObject* camera, Vector3 world, Vector3& out) {
     Vector3 px = Field<Vector3>(ret, 0x10);
     if (px.z <= 0.0f || !std::isfinite(px.x) || !std::isfinite(px.y)) return false;
     if (s_pixW <= 0.0f || s_pixH <= 0.0f) return false;
-    CGRect b = [UIScreen mainScreen].bounds;
-    out.x = px.x / s_pixW * (float)b.size.width;
-    out.y = (1.0f - px.y / s_pixH) * (float)b.size.height;
+    float ow, oh;
+    OverlaySize(ow, oh);
+    out.x = px.x / s_pixW * ow;
+    out.y = (1.0f - px.y / s_pixH) * oh;
     out.z = px.z;
     return true;
 }
@@ -244,30 +321,83 @@ static Il2CppObject* GetMainCamera() {
 // ============================================================
 //  Lista de players (atualizada no hook de PlayerUpdate)
 // ============================================================
-static std::vector<Il2CppObject*> s_players;
-static pthread_mutex_t            s_playerMtx = PTHREAD_MUTEX_INITIALIZER;
+// Posição (mundo) da Camera.main.
+static bool CameraPosition(Il2CppObject* cam, Vector3& out) {
+    ResolveManagedHelpers();
+    if (!cam || !s_mGetTransform || !g_il2cpp.runtime_invoke) return false;
+    void* ex = nullptr;
+    Il2CppObject* tr = g_il2cpp.runtime_invoke(s_mGetTransform, cam, nullptr, &ex);
+    if (!tr || ex) return false;
+    out = GetTransformPosition(tr);
+    return std::isfinite(out.x) && std::isfinite(out.y) && std::isfinite(out.z);
+}
+
+static double NowSec() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+// Cada entrada guarda quando o Update do player rodou pela última vez. Objetos
+// destruídos/desativados param de receber Update; sem isso eles ficavam na lista
+// para sempre (ESP desenhando "fantasmas" e ponteiros velhos sendo dereferenciados).
+struct PlayerEntry { Il2CppObject* p; double lastSeen; };
+static std::vector<PlayerEntry> s_players;
+static pthread_mutex_t          s_playerMtx = PTHREAD_MUTEX_INITIALIZER;
+static const double kPlayerStaleSec = 1.0;   // sem Update há mais que isso = ausente (uncalibrated)
+static const double kPlayerPruneSec = 10.0;  // remove da lista depois disso
 
 static void AddPlayer(Il2CppObject* p) {
+    double now = NowSec();
     pthread_mutex_lock(&s_playerMtx);
-    for (auto& x : s_players) if (x == p) { pthread_mutex_unlock(&s_playerMtx); return; }
-    s_players.push_back(p);
+    for (auto& e : s_players) {
+        if (e.p == p) { e.lastSeen = now; pthread_mutex_unlock(&s_playerMtx); return; }
+    }
+    s_players.push_back({ p, now });
     pthread_mutex_unlock(&s_playerMtx);
 }
 
 static void RemoveDeadPlayers() {
-    // chamado periodicamente no Update do local player
-    // limpa ponteiros que não estão mais vivos (heurística: transform null)
+    // chamado periodicamente no Update do local player. Só usa o tempo: não
+    // dereferencia ponteiros que podem já ter sido coletados.
+    double now = NowSec();
     pthread_mutex_lock(&s_playerMtx);
     s_players.erase(
-        std::remove_if(s_players.begin(), s_players.end(), [](Il2CppObject* p) {
-            if (!p) return true;
-            Il2CppObject* tr = Field<Il2CppObject*>(p, PlayerMove::myPlayerTransform);
-            return tr == nullptr;
+        std::remove_if(s_players.begin(), s_players.end(), [now](const PlayerEntry& e) {
+            return !e.p || (now - e.lastSeen) > kPlayerPruneSec;
         }),
         s_players.end());
     pthread_mutex_unlock(&s_playerMtx);
 }
 
+// Players vistos recentemente (cópia dos ponteiros).
+static void LivePlayers(std::vector<Il2CppObject*>& out) {
+    double now = NowSec();
+    pthread_mutex_lock(&s_playerMtx);
+    for (const auto& e : s_players)
+        if (e.p && (now - e.lastSeen) <= kPlayerStaleSec) out.push_back(e.p);
+    pthread_mutex_unlock(&s_playerMtx);
+}
+
+static bool IsPlayerLive(Il2CppObject* p) {
+    if (!p) return false;
+    double now = NowSec();
+    bool live = false;
+    pthread_mutex_lock(&s_playerMtx);
+    for (const auto& e : s_players)
+        if (e.p == p) { live = (now - e.lastSeen) <= kPlayerStaleSec; break; }
+    pthread_mutex_unlock(&s_playerMtx);
+    return live;
+}
+
+static size_t PlayerCount() {
+    pthread_mutex_lock(&s_playerMtx);
+    size_t n = s_players.size();
+    pthread_mutex_unlock(&s_playerMtx);
+    return n;
+}
+
+// ============================================================
 // ============================================================
 //  Aimbot: seleciona alvo mais próximo ao centro da tela
 // ============================================================
@@ -286,6 +416,54 @@ static bool IsLocalPlayer(Il2CppObject* player) {
 }
 
 static Il2CppObject* s_localPlayer = nullptr;
+
+// Vários objetos podem ter PhotonView.isMine == true ao mesmo tempo (visto no log:
+// dois "local players" alternando, cada um girando seu próprio myCameraContainer).
+// O verdadeiro é o cujo myCameraContainer (0x478) está colado na Camera.main.
+struct LocalCand { Il2CppObject* p; float dist; double seen; };
+static LocalCand s_cands[8] = {};
+static int       s_candCount = 0;
+
+static void UpdateLocalCandidate(Il2CppObject* self) {
+    double now = NowSec();
+    float dist = 1e6f; // desconhecida
+    Il2CppObject* cam  = GetMainCamera();
+    Il2CppObject* cont = Field<Il2CppObject*>(self, 0x478);
+    Vector3 cp;
+    if (cam && cont && CameraPosition(cam, cp))
+        dist = AM_Len(AM_Sub(GetTransformPosition(cont), cp));
+
+    int idx = -1;
+    for (int i = 0; i < s_candCount; i++) if (s_cands[i].p == self) { idx = i; break; }
+    if (idx < 0) {
+        if (s_candCount < 8) idx = s_candCount++;
+        else {
+            idx = 0;
+            for (int i = 1; i < 8; i++) if (s_cands[i].seen < s_cands[idx].seen) idx = i;
+        }
+        s_cands[idx].p = self;
+    }
+    s_cands[idx].dist = dist;
+    s_cands[idx].seen = now;
+
+    Il2CppObject* best = nullptr;
+    float bestDist = 1e30f;
+    int fresh = 0;
+    for (int i = 0; i < s_candCount; i++) {
+        if (now - s_cands[i].seen > 1.0) continue;
+        fresh++;
+        float d = s_cands[i].dist;
+        if (d < bestDist || (d == bestDist && s_cands[i].p == s_localPlayer)) {
+            bestDist = d;
+            best = s_cands[i].p;
+        }
+    }
+    if (best && best != s_localPlayer) {
+        s_localPlayer = best;
+        PG3D_Log("[pg3d_tweak] LOCAL: escolhido=%p dist_camera=%.2fm candidatos_isMine=%d",
+                 (void*)best, bestDist, fresh);
+    }
+}
 
 // ============================================================
 //  Teamcheck: lê o estado (enabled) dos componentes de outline que o
@@ -325,31 +503,33 @@ static TeamStatus GetTeamStatus(Il2CppObject* player) {
 }
 
 // ============================================================
-//  Wallcheck: Physics.Raycast entre a cabeça do player local e a cabeça
-//  do alvo. true = bloqueado (há algo no meio). Ver aviso sobre a
-//  sobrecarga de Raycast assumida, junto da declaração de s_mRaycast.
+//  Wallcheck: Physics.Linecast(Vector3, Vector3) da câmera até o ponto
+//  de mira. true = há algo no meio. Resolvido por assinatura exata (a
+//  versão por contagem de parâmetros pegava a overload errada).
+//  A linha para kWallCheckEndPad metros antes do ponto para não bater no
+//  collider do próprio alvo; um Raycast/Linecast que começa DENTRO de um
+//  collider (o do jogador local) não o detecta.
 // ============================================================
-static bool RaycastBlocked(Vector3 from, Vector3 to) {
-    // DESATIVADO (confirmado quebrado em teste real): a overload de
-    // Physics.Raycast resolvida por param_count==3 estava reportando
-    // "bloqueado" para praticamente qualquer alvo, inclusive sem parede
-    // nenhuma no meio — matava o aimbot inteiro com wallCheck ligado.
-    // s_mRaycast continua sendo resolvido (aparece no log de DIAG) só
-    // para investigação futura; o resultado dele não é mais usado aqui.
-    // Próximo passo real: decompilar o endereço logado em "Raycast(3
-    // args, NAO CONFIRMADO)=%p" (IDA/Ghidra na GameAssembly) pra ver os
-    // tipos reais dos 3 parâmetros, ou localizar a overload certa via
-    // il2cpp_method_get_param em vez de contar quantidade de argumentos.
-    (void)from; (void)to;
-    static bool s_warnLogged = false;
-    if (!s_warnLogged) {
-        s_warnLogged = true;
-        PG3D_Log("[pg3d_tweak] WALLCHECK: desativado nesta build — a overload de Raycast "
-                 "resolvida nao reflete linha de visada real (confirmado em log anterior). "
-                 "wallCheck fica sem efeito ate a overload certa ser identificada.");
+static bool s_wallUnavailLogged = false;
+
+static bool LinecastBlocked(Vector3 from, Vector3 to, float endPad) {
+    if (!s_mLinecast || !g_il2cpp.runtime_invoke) {
+        if (!s_wallUnavailLogged) {
+            s_wallUnavailLogged = true;
+            PG3D_Log("[pg3d_tweak] WALLCHECK: Physics.Linecast(Vector3,Vector3) nao resolvido; "
+                     "wallcheck sem efeito (falha aberta). Ver linhas OVERLOAD no log.");
+        }
+        return false; // falha aberta: nunca esconde um alvo por falta de dado
     }
-    return false;
+    Vector3 end = AM_SegmentEnd(from, to, endPad);
+    void* args[2] = { &from, &end };
+    void* ex = nullptr;
+    Il2CppObject* ret = g_il2cpp.runtime_invoke(s_mLinecast, nullptr, args, &ex);
+    if (!ret || ex) return false;
+    return Field<bool>(ret, 0x10); // bool boxed
 }
+
+extern "C" bool Aim_WallCheckAvailable(void) { return s_mLinecast != nullptr; }
 
 // ============================================================
 //  Diagnóstico sob demanda: loga o estado REAL (resolvido em runtime ou
@@ -362,11 +542,11 @@ static bool RaycastBlocked(Vector3 from, Vector3 to) {
 extern "C" void Diag_LogFilterStatus(const char* who) {
     PG3D_Log("[pg3d_tweak] DIAG(%s): ready=%d localPlayer=%p players=%zu | "
              "teamcheck: cls_Behaviour=%p get_enabled=%p | "
-             "wallcheck: cls_Physics=%p Raycast=%p | "
+             "wallcheck: cls_Physics=%p Raycast=%p Linecast=%p | "
              "flags: teamCheck=%d wallCheck=%d minRange=%.1f aimbot=%d aimLock=%d",
-             who, (int)g_cheat.initialized, (void*)s_localPlayer, s_players.size(),
+             who, (int)g_cheat.initialized, (void*)s_localPlayer, PlayerCount(),
              (void*)cls_Behaviour, (void*)s_mGetEnabled,
-             (void*)cls_Physics, (void*)s_mRaycast,
+             (void*)cls_Physics, (void*)s_mRaycast, (void*)s_mLinecast,
              (int)g_cheat.teamCheck, (int)g_cheat.wallCheck, g_cheat.minRange,
              (int)g_cheat.aimbot, (int)g_cheat.aimLock);
 }
@@ -385,12 +565,12 @@ extern "C" bool Player_PassesFilters(Il2CppObject* player) {
     // problema é em outro lugar.
     if (g_cheat.teamCheck || g_cheat.wallCheck) {
         static int s_filterLogCnt = 0;
-        if (s_filterLogCnt++ % 180 == 0) {
+        if (s_filterLogCnt++ % 3000 == 0) {
             TeamStatus dbgTeam = g_cheat.teamCheck ? GetTeamStatus(player) : TeamStatus::Unknown;
             PG3D_Log("[pg3d_tweak] FILTER: player=%p teamCheck=%d team=%d(0=Unk,1=Ally,2=Enemy) "
-                     "wallCheck=%d Raycast_resolved=%d",
+                     "wallCheck=%d Linecast_resolved=%d",
                      (void*)player, (int)g_cheat.teamCheck, (int)dbgTeam,
-                     (int)g_cheat.wallCheck, (int)(s_mRaycast != nullptr));
+                     (int)g_cheat.wallCheck, (int)(s_mLinecast != nullptr));
         }
     }
 
@@ -413,145 +593,289 @@ extern "C" bool Player_PassesFilters(Il2CppObject* player) {
         // Sem Transform resolvido: não dá para medir distância -> não filtra.
     }
 
-    if (g_cheat.wallCheck && s_localPlayer) {
-        Il2CppObject* myHead    = Field<Il2CppObject*>(s_localPlayer, PlayerMove::headTransform);
-        Il2CppObject* theirHead = Field<Il2CppObject*>(player,        PlayerMove::headTransform);
-        if (myHead && theirHead) {
-            Vector3 from = GetTransformPosition(myHead);
-            Vector3 to   = GetTransformPosition(theirHead);
-            if (RaycastBlocked(from, to)) return false;
-        }
-    }
-
+    // wallcheck NÃO entra aqui: vale só para a MIRA (por ponto do corpo, em
+    // BestPointForPlayer). O ESP continua mostrando quem está atrás de parede.
     return true;
 }
 
-struct AimTarget {
-    Il2CppObject* player;
-    Vector3       screenPos;
-    float         distFromCenter;
+// ============================================================
+//  Aimbot: partes do corpo, wallcheck e lock
+// ============================================================
+// Valores abaixo são HIPÓTESES, não medidas neste build (ver CALIB no log):
+static constexpr float kFeetOffsetY     = -0.1f;  // mesma suposição do ESP: pés = myPlayerTransform - 0.1
+static constexpr float kFracHead        = 1.00f;  // fração pés -> cabeça de cada parte do corpo
+static constexpr float kFracChest       = 0.75f;
+static constexpr float kFracStomach     = 0.55f;
+static constexpr float kFracLegs        = 0.25f;
+static constexpr float kWallCheckEndPad = 0.6f;   // metros: a linha de visada para antes do ponto alvo
+
+struct AimPoint  { Vector3 world; Vector3 screen; float dist; bool isHead; };
+struct AimTarget { Il2CppObject* player; AimPoint pt; };
+
+static Il2CppObject* s_lockedTarget = nullptr;
+
+// Centro (cx, cy) e raio do círculo de FOV, em pontos do overlay.
+static float FovRadiusPts(float& cx, float& cy) {
+    float w, h;
+    OverlaySize(w, h);
+    cx = w * 0.5f;
+    cy = h * 0.5f;
+    return AM_FovRadius(cx, cy, g_cheat.aimbotFov);
+}
+extern "C" float Aim_FovRadiusPoints(void) {
+    float cx, cy;
+    return FovRadiusPts(cx, cy);
+}
+
+// Pés (myPlayerTransform - kFeetOffsetY) e cabeça (headTransform) em mundo.
+static bool PlayerBodyEnds(Il2CppObject* p, Vector3& feet, Vector3& head) {
+    Il2CppObject* headTr = Field<Il2CppObject*>(p, PlayerMove::headTransform);
+    Il2CppObject* bodyTr = Field<Il2CppObject*>(p, PlayerMove::myPlayerTransform);
+    if (!headTr || !bodyTr) return false;
+    head = GetTransformPosition(headTr);
+    feet = GetTransformPosition(bodyTr);
+    feet.y += kFeetOffsetY;
+    return std::isfinite(head.x) && std::isfinite(head.y) && std::isfinite(head.z) &&
+           std::isfinite(feet.x) && std::isfinite(feet.y) && std::isfinite(feet.z);
+}
+
+struct PartDef { unsigned char bit; float frac; };
+static const PartDef kParts[] = {
+    { AIM_PART_HEAD,    kFracHead    },
+    { AIM_PART_CHEST,   kFracChest   },
+    { AIM_PART_STOMACH, kFracStomach },
+    { AIM_PART_LEGS,    kFracLegs    },
 };
 
+// Melhor ponto de mira de UM player: entre as partes marcadas, a mais perto do
+// centro da tela que (a) está dentro do círculo de FOV (se requireFov) e (b) não
+// tem parede no meio (se wallCheck e a posição da câmera é conhecida).
+static bool BestPointForPlayer(Il2CppObject* camera, Il2CppObject* p, bool requireFov,
+                               bool haveCam, const Vector3& camPos, AimPoint& out) {
+    Vector3 feet, head;
+    if (!PlayerBodyEnds(p, feet, head)) return false;
+    float cx, cy;
+    float radius = FovRadiusPts(cx, cy);
+    unsigned char mask = g_cheat.aimParts ? g_cheat.aimParts : (unsigned char)AIM_PART_HEAD;
+    bool found = false;
+    out.dist = 1e9f;
+    for (const PartDef& part : kParts) {
+        if (!(mask & part.bit)) continue;
+        Vector3 w = AM_Lerp(feet, head, part.frac);
+        Vector3 ss;
+        if (!WorldToScreen(camera, w, ss)) continue;
+        float dx = ss.x - cx, dy = ss.y - cy;
+        float d = std::sqrt(dx * dx + dy * dy);
+        if (requireFov && d > radius) continue;
+        if (g_cheat.wallCheck && haveCam && LinecastBlocked(camPos, w, kWallCheckEndPad)) continue;
+        if (d < out.dist) {
+            out.world  = w;
+            out.screen = ss;
+            out.dist   = d;
+            out.isHead = (part.bit == AIM_PART_HEAD);
+            found = true;
+        }
+    }
+    return found;
+}
+
+// Escolhe o alvo: players vivos que passam nos filtros (teamcheck/minRange), com
+// algum ponto do corpo visível dentro do círculo de FOV; vence o mais perto do centro.
 static AimTarget SelectAimTarget(Il2CppObject* camera) {
-    AimTarget best = { nullptr, {}, 1e9f };
+    AimTarget best = {};
+    best.pt.dist = 1e9f;
     if (!camera) return best;
 
-    // Centro da tela
-    // UIScreen.mainScreen.bounds – usamos 1920/2 e 1080/2 como fallback
-    // (o overlay corrige antes de desenhar)
-    CGRect screen = [UIScreen mainScreen].bounds;
-    // WorldToScreen já devolve pontos UIKit (origem topo-esquerdo), sem fator de escala.
-    float cx = (float)screen.size.width  * 0.5f;
-    float cy = (float)screen.size.height * 0.5f;
+    Vector3 camPos = {0, 0, 0};
+    bool haveCam = g_cheat.wallCheck && CameraPosition(camera, camPos);
 
-    float fovRad = g_cheat.aimbotFov * (M_PI / 180.0f);
-    // Comparação é feita abaixo via sinf(fovRad/2) contra a proporção
-    // dist/screenLen (ver loop); não usamos cosFov aqui.
-
-    pthread_mutex_lock(&s_playerMtx);
-    std::vector<Il2CppObject*> copy = s_players;
-    pthread_mutex_unlock(&s_playerMtx);
-
-    for (Il2CppObject* p : copy) {
+    std::vector<Il2CppObject*> live;
+    LivePlayers(live);
+    for (Il2CppObject* p : live) {
         if (!p || p == s_localPlayer) continue;
-        if (!Player_PassesFilters(p)) continue; // teamcheck / minRange / wallcheck
-
-        Il2CppObject* headTr = Field<Il2CppObject*>(p, PlayerMove::headTransform);
-        if (!headTr) continue;
-
-        Vector3 headWS = GetTransformPosition(headTr);
-        Vector3 ss;
-        if (!WorldToScreen(camera, headWS, ss)) continue;
-
-        float dx = ss.x - cx;
-        float dy = ss.y - cy;
-        float dist = sqrtf(dx*dx + dy*dy);
-
-        // Checa se está dentro do FOV (em pixels)
-        // alternativa: comparar cos do ângulo na tela
-        float screenLen = sqrtf(cx*cx + cy*cy);
-        if (dist / screenLen > sinf(fovRad * 0.5f)) continue;
-
-        if (dist < best.distFromCenter) {
-            best.player        = p;
-            best.screenPos     = ss;
-            best.distFromCenter= dist;
-        }
+        if (!Player_PassesFilters(p)) continue; // teamcheck / minRange
+        AimPoint pt;
+        if (!BestPointForPlayer(camera, p, true, haveCam, camPos, pt)) continue;
+        if (pt.dist < best.pt.dist) { best.player = p; best.pt = pt; }
     }
     return best;
 }
 
-// Envia toque simulado de look via UIApplication (aproximação simples):
-// No PG3D o look é controlado por input touchscreen, não por mouse.
-// A forma mais limpa é rotacionar o myCameraContainer do local player.
-// Usamos o Transform.set_rotation ou LookAt via icall.
+// Trava a mira no melhor alvo que está agora dentro do círculo de FOV.
+extern "C" bool Aim_LockAcquire(void) {
+    if (!s_localPlayer) return false;
+    Il2CppObject* cam = GetMainCamera();
+    if (!cam) return false;
+    AimTarget t = SelectAimTarget(cam);
+    if (!t.player) return false;
+    s_lockedTarget = t.player;
+    g_cheat.aimLock = true;
+    PG3D_Log("[pg3d_tweak] LOCK: alvo=%p dist_do_centro=%.1fpt", (void*)t.player, t.pt.dist);
+    return true;
+}
+
+extern "C" void Aim_LockRelease(void) {
+    s_lockedTarget = nullptr;
+    g_cheat.aimLock = false;
+}
+
+// Rotaciona o myCameraContainer do local player (PG3D lê o look do touch, não de mouse).
+// Cabeça: Transform.LookAt(Transform) — caminho que já funcionava. Outras partes:
+// Transform.set_rotation(LookRotation(dir, up)), equivalente a um LookAt num ponto.
 static MethodInfo* meth_Transform_LookAt = nullptr;
 
-// Limite de pitch (graus) acima do qual NÃO chamamos LookAt neste frame.
-// Motivo: confirmado em teste real que, com um toggle de aim ativo, o
-// joystick inverte de direção — mecanismo mais provável é o LookAt
-// forçando a câmera a passar de ~90° de pitch (mirando quase reto pra
-// cima/baixo), o que pode inverter o sinal do "forward" projetado no
-// plano horizontal usado pelo cálculo de movimento. Isso é uma proteção
-// preventiva (evitar entrar na zona de risco), não uma prova de que o
-// limite exato é 75° — se ainda inverter, o valor deste limite é o
-// primeiro lugar pra apertar (baixar pra 60/50) ou afrouxar.
+// Limite de pitch (graus) acima do qual NÃO giramos a câmera neste frame: protege
+// contra a inversão de joystick relatada quando o LookAt força ~90° de pitch.
+// Valor não calibrado (primeiro lugar para apertar/afrouxar se ainda inverter).
 static constexpr float kMaxAimPitchDeg = 75.0f;
 
-static void AimAtTarget(Il2CppObject* localPlayer, Il2CppObject* targetHeadTransform) {
-    if (!localPlayer || !targetHeadTransform) return;
-
-    // Pega o container de câmera do player local.
-    // 0x478 = myCameraContainer, CONFIRMADO contra o dump.cs real
-    // (PlayerMove, campo "public UnityEngine.Transform myCameraContainer; // 0x478").
+static void AimAtPoint(Il2CppObject* localPlayer, Il2CppObject* targetPlayer, const AimPoint& pt) {
+    if (!localPlayer || !targetPlayer) return;
+    // 0x478 = myCameraContainer (confirmado contra o dump.cs, ver offsets.h).
     Il2CppObject* camContainer = Field<Il2CppObject*>(localPlayer, 0x478);
-    if (!camContainer || !meth_Transform_LookAt) return;
+    if (!camContainer) return;
 
-    // Checa o ângulo vertical ANTES de girar a câmera. Usa GetTransformPosition,
-    // já confirmado funcionando (mesma chamada usada pelos filtros/ESP).
-    {
-        Vector3 camPos    = GetTransformPosition(camContainer);
-        Vector3 targetPos = GetTransformPosition(targetHeadTransform);
-        float dx = targetPos.x - camPos.x;
-        float dy = targetPos.y - camPos.y;
-        float dz = targetPos.z - camPos.z;
-        float horiz = sqrtf(dx*dx + dz*dz);
-        float pitchDeg = atan2f(dy, horiz) * (180.0f / (float)M_PI);
-        if (fabsf(pitchDeg) > kMaxAimPitchDeg) {
-            static int s_skipLogCnt = 0;
-            if (s_skipLogCnt++ % 60 == 0) {
-                PG3D_Log("[pg3d_tweak] AIMAT: pulando LookAt neste frame, pitch=%.1f graus "
-                         "(limite=%.1f) para evitar inversao de joystick", pitchDeg, kMaxAimPitchDeg);
-            }
-            return;
+    Vector3 origin = GetTransformPosition(camContainer);
+    Vector3 d = AM_Sub(pt.world, origin);
+    float horiz = std::sqrt(d.x * d.x + d.z * d.z);
+    float pitchDeg = std::atan2(d.y, horiz) * (180.0f / (float)M_PI);
+    if (std::fabs(pitchDeg) > kMaxAimPitchDeg) {
+        static int s_skipLogCnt = 0;
+        if (s_skipLogCnt++ % 60 == 0) {
+            PG3D_Log("[pg3d_tweak] AIMAT: pulando neste frame, pitch=%.1f graus (limite=%.1f) "
+                     "para evitar inversao de joystick", pitchDeg, kMaxAimPitchDeg);
         }
+        return;
     }
 
-    // DIAGNÓSTICO (inversão de joystick relatada com aimLock ligado):
-    // loga periodicamente pra confirmar se este LookAt é de fato o que
-    // está rodando quando o problema aparece, e com quais ponteiros.
-    // Este hook é PRÉ-EXISTENTE (não foi adicionado nesta sessão) — o
-    // log serve só pra isolar se a causa é aqui ou em outro lugar.
-    static int s_aimLogCnt = 0;
-    if (s_aimLogCnt++ % 60 == 0) {
-        PG3D_Log("[pg3d_tweak] AIMAT: localPlayer=%p camContainer=%p targetHead=%p LookAtMethod=%p",
-                 (void*)localPlayer, (void*)camContainer, (void*)targetHeadTransform,
-                 (void*)meth_Transform_LookAt);
-    }
-
-    // Transform.LookAt(Transform target) recebe o Transform diretamente via icall/
-    // runtime_invoke; não precisamos da posição em Vector3 aqui.
-    void* args[1] = { targetHeadTransform };
+    Il2CppObject* headTr = Field<Il2CppObject*>(targetPlayer, PlayerMove::headTransform);
     void* ex = nullptr;
-    g_il2cpp.runtime_invoke(meth_Transform_LookAt, camContainer, args, &ex);
+    const char* path = "?";
+    if (pt.isHead && meth_Transform_LookAt && headTr) {
+        path = "LookAt(cabeca)";
+        void* args[1] = { headTr };
+        g_il2cpp.runtime_invoke(meth_Transform_LookAt, camContainer, args, &ex);
+    } else if (s_mSetRot) {
+        Quaternion q;
+        if (!AM_LookRotation(d, Vector3{0, 1, 0}, q)) return;
+        path = "set_rotation";
+        void* args[1] = { &q };
+        g_il2cpp.runtime_invoke(s_mSetRot, camContainer, args, &ex);
+    } else if (meth_Transform_LookAt && headTr) {
+        path = "LookAt(cabeca, fallback: set_rotation indisponivel)";
+        void* args[1] = { headTr };
+        g_il2cpp.runtime_invoke(meth_Transform_LookAt, camContainer, args, &ex);
+    } else {
+        return;
+    }
+
+    static int s_aimLogCnt = 0;
+    if (s_aimLogCnt++ % 300 == 0) {
+        PG3D_Log("[pg3d_tweak] AIMAT: local=%p camContainer=%p alvo=%p via %s", (void*)localPlayer,
+                 (void*)camContainer, (void*)targetPlayer, path);
+    }
     if (ex) {
         static bool s_exLogged = false;
         if (!s_exLogged) {
             s_exLogged = true;
-            PG3D_Log("[pg3d_tweak] AIMAT: Transform.LookAt lancou excecao (ex=%p) — "
-                     "resultado da rotacao pode ficar indefinido", ex);
+            PG3D_Log("[pg3d_tweak] AIMAT: rotacao lancou excecao (ex=%p) via %s", ex, path);
         }
     }
+}
+
+// ---- Calibração do ESP/mira: mede a altura cabeça-raiz de um alvo real ----
+static void LogCalib() {
+    std::vector<Il2CppObject*> live;
+    LivePlayers(live);
+    for (Il2CppObject* p : live) {
+        if (p == s_localPlayer) continue;
+        Il2CppObject* headTr = Field<Il2CppObject*>(p, PlayerMove::headTransform);
+        Il2CppObject* bodyTr = Field<Il2CppObject*>(p, PlayerMove::myPlayerTransform);
+        if (!headTr || !bodyTr) continue;
+        Vector3 h = GetTransformPosition(headTr);
+        Vector3 r = GetTransformPosition(bodyTr);
+        PG3D_Log("[pg3d_tweak] CALIB: alvo=%p head.y-root.y=%.2f head=(%.2f,%.2f,%.2f) root=(%.2f,%.2f,%.2f) vivos=%zu",
+                 (void*)p, h.y - r.y, h.x, h.y, h.z, r.x, r.y, r.z, live.size());
+        break;
+    }
+}
+
+// ---- Descoberta do campo de time (medição, não suposição) ----
+// O teamcheck por outline sempre dava "desconhecido" (os dois outlines com
+// enabled=0). Em vez de inventar um offset, lista TODOS os campos de Player_move_c
+// (e das classes pai) em pg3d_fields.txt e loga o valor dos campos escalares com
+// nome parecido com time/comando/aliado/bot para o local player e até 3 outros.
+static bool FmtScalar(Il2CppObject* o, size_t off, const char* tn, char* out, size_t n) {
+    ptrdiff_t po = (ptrdiff_t)off;
+    if (!strcmp(tn, "System.Boolean") || !strcmp(tn, "System.Byte") || !strcmp(tn, "System.SByte"))
+        { snprintf(out, n, "%u", (unsigned)Field<uint8_t>(o, po)); return true; }
+    if (!strcmp(tn, "System.Int16") || !strcmp(tn, "System.UInt16"))
+        { snprintf(out, n, "%d", (int)Field<int16_t>(o, po)); return true; }
+    if (!strcmp(tn, "System.Int32") || !strcmp(tn, "System.UInt32"))
+        { snprintf(out, n, "%d", (int)Field<int32_t>(o, po)); return true; }
+    if (!strcmp(tn, "System.Int64") || !strcmp(tn, "System.UInt64"))
+        { snprintf(out, n, "%lld", (long long)Field<int64_t>(o, po)); return true; }
+    if (!strcmp(tn, "System.Single"))
+        { snprintf(out, n, "%.2f", (double)Field<float>(o, po)); return true; }
+    return false;
+}
+
+static void DumpTeamCandidatesOnce() {
+    static bool done = false;
+    static double firstSeen = 0.0;
+    static int tick = 0;
+    if (done) return;
+    if (tick++ % 60 != 0) return;
+    double now = NowSec();
+    if (firstSeen == 0.0) firstSeen = now;
+    if (now - firstSeen < 8.0) return; // espera a partida estabilizar
+
+    std::vector<Il2CppObject*> live, others;
+    LivePlayers(live);
+    for (Il2CppObject* p : live)
+        if (p != s_localPlayer && others.size() < 3) others.push_back(p);
+    if (others.empty()) return; // tenta de novo quando aparecer alguém
+    done = true;
+
+    if (!g_il2cpp.class_get_fields || !g_il2cpp.field_get_name || !g_il2cpp.field_get_offset ||
+        !g_il2cpp.field_get_type || !g_il2cpp.type_get_name) {
+        PG3D_Log("[pg3d_tweak] TEAMDUMP: API de campos indisponivel neste build");
+        return;
+    }
+    char path[256];
+    const char* tmp = NSTemporaryDirectory().fileSystemRepresentation;
+    snprintf(path, sizeof(path), "%s/pg3d_fields.txt", tmp ? tmp : "/tmp");
+    FILE* f = fopen(path, "w");
+    PG3D_Log("[pg3d_tweak] TEAMDUMP: lista completa de campos em %s (local=%p, outros=%zu)",
+             path, (void*)s_localPlayer, others.size());
+
+    static const char* const kKeys[] = { "team", "command", "ally", "enemy", "friend", "clan",
+                                         "bot", "dead", "alive", "mine", "color" };
+    int logged = 0;
+    for (Il2CppClass* k = cls_PlayerMove; k; ) {
+        void* it = nullptr;
+        while (Il2CppField* fl = g_il2cpp.class_get_fields(k, &it)) {
+            const char* name = g_il2cpp.field_get_name(fl);
+            size_t off = g_il2cpp.field_get_offset(fl);
+            const Il2CppType* ty = g_il2cpp.field_get_type(fl);
+            char* tn = ty ? g_il2cpp.type_get_name(ty) : nullptr;
+            if (!name || !tn) continue;
+            if (f) fprintf(f, "0x%zx\t%s\t%s\n", off, tn, name);
+
+            bool match = false;
+            for (const char* key : kKeys) if (strcasestr(name, key)) { match = true; break; }
+            if (!match || logged >= 60) continue;
+            char lv[32];
+            if (!FmtScalar(s_localPlayer, off, tn, lv, sizeof(lv))) continue;
+            char ov[3][32] = {"-", "-", "-"};
+            for (size_t i = 0; i < others.size(); i++) FmtScalar(others[i], off, tn, ov[i], sizeof(ov[i]));
+            PG3D_Log("[pg3d_tweak] TEAMDUMP: %s %s @0x%zx local=%s outros=[%s,%s,%s]",
+                     tn, name, off, lv, ov[0], ov[1], ov[2]);
+            logged++;
+        }
+        k = g_il2cpp.class_get_parent ? g_il2cpp.class_get_parent(k) : nullptr;
+    }
+    if (f) fclose(f);
 }
 
 // ============================================================
@@ -561,21 +885,17 @@ static void hook_PlayerUpdate(Il2CppObject* self, void* /*unused*/) {
     {
         static int s_updCnt = 0;
         if (s_updCnt++ % 600 == 0) {
-            pthread_mutex_lock(&s_playerMtx);
-            size_t np = s_players.size();
-            pthread_mutex_unlock(&s_playerMtx);
-            PG3D_Log("[pg3d_tweak] UPDATE #%d self=%p local=%p isMineMeth=%p cam=%p players=%zu aimbot=%d esp=%d",
+            PG3D_Log("[pg3d_tweak] UPDATE #%d self=%p local=%p isMineMeth=%p cam=%p players=%zu aimbot=%d aimLock=%d esp=%d",
                      s_updCnt, (void*)self, (void*)s_localPlayer, (void*)meth_isMine,
-                     (void*)s_mainCam, np, (int)g_cheat.aimbot, (int)g_cheat.esp);
+                     (void*)s_mainCam, PlayerCount(), (int)g_cheat.aimbot, (int)g_cheat.aimLock,
+                     (int)g_cheat.esp);
         }
     }
-    // Registra este player na lista global
+    // Registra/atualiza este player na lista global (marca "visto agora")
     AddPlayer(self);
 
-    // Detecta o local player: aquele cujo PhotonView.isMine == true
-    if (IsLocalPlayer(self)) {
-        s_localPlayer = self;
-    }
+    // Local player: entre os objetos com PhotonView.isMine, o que está colado na câmera
+    if (IsLocalPlayer(self)) UpdateLocalCandidate(self);
 
     // Chama o original
     if (orig_PlayerUpdate) orig_PlayerUpdate(self, nullptr);
@@ -583,20 +903,34 @@ static void hook_PlayerUpdate(Il2CppObject* self, void* /*unused*/) {
     // ---- Lógica do cheat (roda somente para o local player) ----
     if (self != s_localPlayer || !s_localPlayer) return;
 
-    // Limpeza periódica de players mortos
+    // Limpeza periódica de players ausentes
     static int cleanCnt = 0;
     if (++cleanCnt >= 60) { cleanCnt = 0; RemoveDeadPlayers(); }
+
+    static int calibCnt = 0;
+    if (calibCnt++ % 600 == 0) LogCalib();
+    DumpTeamCandidatesOnce();
 
     Il2CppObject* camera = GetMainCamera();
     if (!camera) return;
 
-    // ---- Aimbot / AimLock ----
-    if (g_cheat.aimbot || g_cheat.aimLock) {
-        AimTarget target = SelectAimTarget(camera);
-        if (target.player) {
-            Il2CppObject* headTr = Field<Il2CppObject*>(target.player, PlayerMove::headTransform);
-            AimAtTarget(s_localPlayer, headTr);
+    if (g_cheat.aimLock) {
+        // Lock: fica no alvo travado até soltar ou o alvo sumir (mesmo fora do FOV).
+        // Se o wallcheck estiver ligado e o alvo ficar atrás de parede, pausa a mira
+        // (mantém a trava) até ele voltar a ficar visível.
+        if (!s_lockedTarget || !IsPlayerLive(s_lockedTarget)) {
+            PG3D_Log("[pg3d_tweak] LOCK: alvo %p sumiu, trava solta", (void*)s_lockedTarget);
+            Aim_LockRelease();
+        } else {
+            Vector3 camPos = {0, 0, 0};
+            bool haveCam = g_cheat.wallCheck && CameraPosition(camera, camPos);
+            AimPoint pt;
+            if (BestPointForPlayer(camera, s_lockedTarget, false, haveCam, camPos, pt))
+                AimAtPoint(s_localPlayer, s_lockedTarget, pt);
         }
+    } else if (g_cheat.aimbot) {
+        AimTarget t = SelectAimTarget(camera);
+        if (t.player) AimAtPoint(s_localPlayer, t.player, t.pt);
     }
 }
 
@@ -725,6 +1059,23 @@ static void* InitThread(void*) {
         g_il2cpp.resolve_icall           = (t_resolve_icall)                 dlsym(RTLD_DEFAULT, "il2cpp_resolve_icall");
     }
 
+    // API de introspecção (opcional): overload por assinatura e lista de campos.
+    // Se faltar, só os recursos que dependem dela ficam indisponíveis (logado abaixo).
+    g_il2cpp.class_get_methods      = (t_il2cpp_class_get_methods)      dlsym(RTLD_DEFAULT, "il2cpp_class_get_methods");
+    g_il2cpp.method_get_name        = (t_il2cpp_method_get_name)        dlsym(RTLD_DEFAULT, "il2cpp_method_get_name");
+    g_il2cpp.method_get_param_count = (t_il2cpp_method_get_param_count) dlsym(RTLD_DEFAULT, "il2cpp_method_get_param_count");
+    g_il2cpp.method_get_param       = (t_il2cpp_method_get_param)       dlsym(RTLD_DEFAULT, "il2cpp_method_get_param");
+    g_il2cpp.type_get_name          = (t_il2cpp_type_get_name)          dlsym(RTLD_DEFAULT, "il2cpp_type_get_name");
+    g_il2cpp.class_get_fields       = (t_il2cpp_class_get_fields)       dlsym(RTLD_DEFAULT, "il2cpp_class_get_fields");
+    g_il2cpp.field_get_name         = (t_il2cpp_field_get_name)         dlsym(RTLD_DEFAULT, "il2cpp_field_get_name");
+    g_il2cpp.field_get_offset       = (t_il2cpp_field_get_offset)       dlsym(RTLD_DEFAULT, "il2cpp_field_get_offset");
+    g_il2cpp.field_get_type         = (t_il2cpp_field_get_type)         dlsym(RTLD_DEFAULT, "il2cpp_field_get_type");
+    g_il2cpp.class_get_parent       = (t_il2cpp_class_get_parent)       dlsym(RTLD_DEFAULT, "il2cpp_class_get_parent");
+    PG3D_Log("[pg3d_tweak] INTROSPECCAO: class_get_methods=%p method_get_param=%p type_get_name=%p class_get_fields=%p field_get_offset=%p class_get_parent=%p",
+             (void*)g_il2cpp.class_get_methods, (void*)g_il2cpp.method_get_param,
+             (void*)g_il2cpp.type_get_name, (void*)g_il2cpp.class_get_fields,
+             (void*)g_il2cpp.field_get_offset, (void*)g_il2cpp.class_get_parent);
+
     if (!g_il2cpp.domain_get || !g_il2cpp.class_from_name || !g_il2cpp.runtime_invoke) {
         PG3D_Log("[pg3d_tweak] ERRO: API IL2CPP incompleta (domain_get=%p class_from_name=%p runtime_invoke=%p)",
                  (void*)g_il2cpp.domain_get, (void*)g_il2cpp.class_from_name, (void*)g_il2cpp.runtime_invoke);
@@ -780,6 +1131,14 @@ static void* InitThread(void*) {
         }
         PG3D_Log("[pg3d_tweak] PHYSICS: UnityEngine.PhysicsModule=%p Physics=%p Raycast(3 args, NAO CONFIRMADO)=%p",
                  (void*)asm_phys, (void*)cls_Physics, (void*)s_mRaycast);
+        if (cls_Physics) {
+            // Assinatura exata (tipos dos parâmetros), não contagem de argumentos.
+            static const char* const kLinecastSig[2] = { "UnityEngine.Vector3", "UnityEngine.Vector3" };
+            s_mLinecast = FindMethodBySig(cls_Physics, "Linecast", kLinecastSig, 2);
+            LogOverloads(cls_Physics, "Linecast");
+            LogOverloads(cls_Physics, "Raycast");
+        }
+        PG3D_Log("[pg3d_tweak] PHYSICS: Linecast(Vector3,Vector3) por assinatura exata=%p", (void*)s_mLinecast);
     }
 
     if (!cls_PlayerMove) {
@@ -884,11 +1243,12 @@ bool HookManager_IsReady(void) {
 
 // Copia snapshot dos players para o caller (thread-safe)
 extern "C" void Players_GetSnapshot(Il2CppObject** buf, int* count, int maxBuf) {
-    pthread_mutex_lock(&s_playerMtx);
-    int n = (int)std::min((size_t)maxBuf, s_players.size());
-    for (int i = 0; i < n; i++) buf[i] = s_players[i];
+    // Só players vistos recentemente (ver PlayerEntry): sem "fantasmas" no ESP.
+    std::vector<Il2CppObject*> live;
+    LivePlayers(live);
+    int n = (int)std::min((size_t)maxBuf, live.size());
+    for (int i = 0; i < n; i++) buf[i] = live[i];
     *count = n;
-    pthread_mutex_unlock(&s_playerMtx);
 }
 
 extern "C" Il2CppObject* Player_GetLocalPlayer(void) {
