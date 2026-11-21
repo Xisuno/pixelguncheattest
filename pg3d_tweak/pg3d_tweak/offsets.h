@@ -36,6 +36,16 @@ namespace PlayerMove {
     static constexpr ptrdiff_t enemyOutline        = 0x1E8;
     // UniqueEffects.Outline.OutlineEffectComponent allyOutlineEffect @ 0x1F0
     static constexpr ptrdiff_t allyOutline         = 0x1F0;
+    // ---- Time (MEDIDO no log TEAMDUMP deste build, partida de times de 6 jogadores) ----
+    // Dois Int32 com nome ofuscado, complementares entre si (valores 1/2, soma 3):
+    //   @0x8F4 = [2,2,1,1,2,2]   @0x8F8 = [1,1,2,2,1,1]   (ordem: local, outro0..outro4)
+    // O mesmo nome ofuscado do campo 0x8F4 existe também em outro objeto, com os
+    // mesmos valores. A semântica "id de time" NÃO vem de dump.cs: foi confirmada em
+    // partida em 2 dos 5 jogadores (outro0 = aliado com o mesmo id do local; outro1 =
+    // inimigo com o id oposto). Os offsets valem só para este build (os nomes são
+    // ofuscados e mudam entre versões).
+    static constexpr ptrdiff_t teamId              = 0x8F4;
+    static constexpr ptrdiff_t otherTeamId         = 0x8F8;
 }
 
 // ============================================================
